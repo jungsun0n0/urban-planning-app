@@ -1,0 +1,7 @@
+streamlit
+requests
+geopandas
+pandas
+matplotlib
+PyPDF2
+python-dotenv

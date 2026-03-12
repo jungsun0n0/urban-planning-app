@@ -1,0 +1,678 @@
+import streamlit as st
+import requests
+import geopandas as gpd
+import pandas as pd
+import warnings
+import time
+from io import BytesIO
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as patheffects
+import platform
+import os
+import PyPDF2
+from dotenv import load_dotenv # ★ 금고 여는 라이브러리 추가
+
+warnings.filterwarnings('ignore')
+
+# ★ 금고(.env) 파일 열기
+load_dotenv()
+
+st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_icon="🏙️", layout="wide")
+
+if platform.system() == 'Windows':
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+else:
+    plt.rcParams['font.family'] = 'AppleGothic'
+plt.rcParams['axes.unicode_minus'] = False
+
+# ==========================================================
+# [설정] 환경변수에서 API 키 안전하게 불러오기! (코드에 키 노출 X)
+# ==========================================================
+VWORLD_KEY = os.getenv("VWORLD_KEY")
+SGIS_KEY = os.getenv("SGIS_KEY")
+SGIS_SECRET = os.getenv("SGIS_SECRET")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ==========================================================
+
+# (이 아래부터는 기존의 SIDO_MAP 등 원래 코드가 그대로 이어지면 됩니다!)
+
+SIDO_MAP = {
+    "서울특별시": "11", "부산광역시": "21", "대구광역시": "22", "인천광역시": "23",
+    "광주광역시": "24", "대전광역시": "25", "울산광역시": "26", "세종특별자치시": "29",
+    "경기도": "31", "강원특별자치도": "32", "충청북도": "33", "충청남도": "34",
+    "전북특별자치도": "35", "전라남도": "36", "경상북도": "37", "경상남도": "38",
+    "제주특별자치도": "39"
+}
+
+MAP_COLORS = {
+    "인구(명)_정규화": ("YlOrBr", "인구 수 (노란색 계통)"),
+    "사업체(수)_정규화": ("Blues", "사업체 수 (파란색 계통)"),
+    "종사자(수)_정규화": ("Purples", "종사자 수 (보라색 계통)"),
+    "중심상업(%)_정규화": ("Reds", "중심상업지역 (빨간색 계통)"),
+    "일반상업(%)_정규화": ("RdPu", "일반상업지역 (분홍색 계통)"),
+    "근린상업(%)_정규화": ("PuRd", "근린상업지역 (자주색 계통)"),
+    "준주거(%)_정규화": ("Oranges", "준주거지역 (주황색 계통)"),
+    "★중심지_지수(합산)": ("PuBu", "중심지 지수 합산 (남색 계통)")
+}
+
+# ==========================================
+# 0. 다이렉트 AI 통신 엔진
+# ==========================================
+def get_best_gemini_model(api_key):
+    models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        m_res = requests.get(models_url, timeout=10)
+        if m_res.status_code == 200:
+            models_data = m_res.json().get('models', [])
+            valid_models = [m['name'] for m in models_data if 'generateContent' in m.get('supportedGenerationMethods', [])]
+            if not valid_models: return "models/gemini-2.5-pro"
+            return next((m for m in valid_models if '2.5-pro' in m.lower()), 
+                   next((m for m in valid_models if 'pro' in m.lower()), valid_models[0]))
+    except Exception:
+        pass
+    return "models/gemini-2.5-pro" # fallback
+
+# 스트림릿 캐시를 사용하여 여러 번 불필요한 모델 목록 조회 방지 (Rate Limit 절약)
+cached_best_model = None
+
+def get_gemini_response(prompt, history, api_key, model_override=None):
+    global cached_best_model
+    
+    if model_override:
+        target_model = model_override
+    else:
+        if not cached_best_model:
+            cached_best_model = get_best_gemini_model(api_key)
+        target_model = cached_best_model
+        
+    if not target_model.startswith("models/"):
+        target_model = f"models/{target_model}"
+        
+    url = f"https://generativelanguage.googleapis.com/v1beta/{target_model}:generateContent?key={api_key}"
+    
+    contents = []
+    for msg in history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+    contents.append({"role": "user", "parts": [{"text": prompt}]})
+    payload = {"contents": contents}
+    headers = {"Content-Type": "application/json"}
+    
+    retries = 3
+    for attempt in range(retries):
+        try:
+            res = requests.post(url, json=payload, headers=headers, timeout=120)
+            if res.status_code == 200:
+                return res.json()['candidates'][0]['content']['parts'][0]['text']
+            elif res.status_code == 429: # Too Many Requests (Rate Limit)
+                if attempt < retries - 1:
+                    time.sleep(10 * (attempt + 1)) # 10초, 20초 후 재시도
+                    continue
+                else:
+                    return "에러 발생! 상태코드 : 429 - AI API 사용량 또는 요청 빈도(Rate Limit) 초과입니다. 1~2분 정도 대기 후 다시 시도해주세요."
+            else:
+                return f"에러 발생! 상태코드: {res.status_code} - {res.text}"
+        except Exception as e:
+            return f"AI 서버 통신 에러 (시간 초과 등): {str(e)}"
+    
+    return "통신에 실패했습니다."
+
+# ==========================================
+# ★ 0-1. 지정된 폴더 안의 문서(PDF, TXT) 읽어오는 함수 추가
+# ==========================================
+def read_folder_documents(folder_name):
+    text_content = ""
+    # 폴더가 없으면 빈 텍스트 반환
+    if not os.path.exists(folder_name):
+        return ""
+    
+    for root, dirs, files in os.walk(folder_name):
+        for file in files:
+            file_path = os.path.join(root, file)
+            # PDF 파일 읽기
+            if file.lower().endswith('.pdf'):
+                try:
+                    with open(file_path, 'rb') as f:
+                        reader = PyPDF2.PdfReader(f)
+                        for page in reader.pages:
+                            extracted = page.extract_text()
+                            if extracted:
+                                text_content += extracted + "\n"
+                except Exception as e:
+                    pass
+            # TXT 파일 읽기
+            elif file.lower().endswith('.txt'):
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        text_content += f.read() + "\n"
+                except Exception:
+                    pass
+    return text_content
+
+# ==========================================
+# 1. API 요청 및 데이터 필터 함수 (기존과 동일)
+# ==========================================
+def safe_req(url, params=None, retries=3):
+    for attempt in range(retries):
+        try:
+            res = requests.get(url, params=params, timeout=15)
+            if res.status_code == 200:
+                return res.json()
+        except Exception:
+            time.sleep(1)
+    return {}
+
+def safe_int(val):
+    try: return int(val)
+    except (ValueError, TypeError): return 0
+
+def get_sgis_token():
+    url = "https://sgisapi.kostat.go.kr/OpenAPI3/auth/authentication.json"
+    res = safe_req(url, {"consumer_key": SGIS_KEY, "consumer_secret": SGIS_SECRET})
+    return res.get("result", {}).get("accessToken")
+
+@st.cache_data(show_spinner=False)
+def get_cached_sigungu_list(sido_code):
+    result_dict = {"전체": [sido_code]}
+    token = get_sgis_token()
+    if not token: return result_dict
+    url = f"https://sgisapi.kostat.go.kr/OpenAPI3/addr/stage.json?cd={sido_code}&pg_yn=0&accessToken={token}"
+    res = safe_req(url)
+    if res and "result" in res:
+        for item in res["result"]:
+            name = item["addr_name"]
+            cd = item["cd"]
+            parts = name.split()
+            if len(parts) == 2 and parts[0].endswith("시") and parts[1].endswith("구"):
+                city_name = parts[0]
+                if city_name not in result_dict:
+                    result_dict[city_name] = []
+                result_dict[city_name].append(cd) 
+            else:
+                result_dict[name] = [cd]
+    return result_dict
+
+def get_sgis_dong(target_codes, year, token):
+    url = "https://sgisapi.kostat.go.kr/OpenAPI3/boundary/hadmarea.geojson"
+    def fetch_dongs(code):
+        res = safe_req(url, {"accessToken": token, "year": year, "adm_cd": code, "low_search": "1"})
+        features = res.get("features", [])
+        if not features: return []
+        sample_cd = features[0]["properties"]["adm_cd"]
+        if len(sample_cd) < 7:
+            sub_dongs = []
+            for f in features:
+                sub_dongs.extend(fetch_dongs(f["properties"]["adm_cd"]))
+            return sub_dongs
+        else:
+            return features
+
+    dong_list = []
+    for code in target_codes:
+        features = fetch_dongs(code)
+        if features:
+            dong_list.append(gpd.GeoDataFrame.from_features(features))
+    if not dong_list: return gpd.GeoDataFrame()
+    gdf = pd.concat(dong_list, ignore_index=True)
+    gdf.set_crs(epsg=5179, inplace=True)
+    return gdf
+
+def get_sgis_stats(dong_gdf, year, token):
+    pop_dict, biz_dict, worker_dict = {}, {}, {}
+    parent_codes = dong_gdf['adm_cd'].astype(str).str[:5].unique()
+    for gu in parent_codes:
+        pop_url = "https://sgisapi.kostat.go.kr/OpenAPI3/stats/searchpopulation.json"
+        pop_res = safe_req(pop_url, {"year": year, "adm_cd": gu, "low_search": "1", "accessToken": token})
+        if pop_res.get("errCd") == 0:
+            for item in pop_res.get("result", []):
+                pop_dict[item["adm_cd"]] = safe_int(item.get("tot_ppltn", item.get("population", 0)))
+        biz_url = "https://sgisapi.kostat.go.kr/OpenAPI3/stats/company.json"
+        biz_res = safe_req(biz_url, {"year": year, "adm_cd": gu, "low_search": "1", "accessToken": token})
+        if biz_res.get("errCd") == 0:
+            for item in biz_res.get("result", []):
+                biz_dict[item["adm_cd"]] = safe_int(item.get("corp_cnt", 0))
+                worker_dict[item["adm_cd"]] = safe_int(item.get("tot_worker", 0))
+    return pop_dict, biz_dict, worker_dict
+
+def get_vworld_zoning_bbox(minx, miny, maxx, maxy, key, depth=0):
+    url = "https://api.vworld.kr/req/wfs"
+    bbox_str = f"{minx},{miny},{maxx},{maxy},EPSG:3857"
+    params = {
+        "key": key, "domain": "http://localhost", "SERVICE": "WFS",
+        "VERSION": "1.1.0", "REQUEST": "GetFeature", "TYPENAME": "lt_c_uq111",
+        "OUTPUT": "application/json", "SRSNAME": "EPSG:3857",
+        "MAXFEATURES": "1000", "BBOX": bbox_str
+    }
+    res = safe_req(url, params)
+    if "features" not in res or len(res["features"]) == 0: 
+        return gpd.GeoDataFrame() 
+    gdf = gpd.GeoDataFrame.from_features(res["features"])
+    gdf.set_crs(epsg=3857, inplace=True)
+    if len(gdf) >= 1000 and depth < 3:
+        midx, midy = (minx + maxx) / 2, (miny + maxy) / 2
+        df1 = get_vworld_zoning_bbox(minx, miny, midx, midy, key, depth+1)
+        df2 = get_vworld_zoning_bbox(midx, miny, maxx, midy, key, depth+1)
+        df3 = get_vworld_zoning_bbox(minx, midy, midx, maxy, key, depth+1)
+        df4 = get_vworld_zoning_bbox(midx, midy, maxx, maxy, key, depth+1)
+        return pd.concat([df1, df2, df3, df4], ignore_index=True)
+    return gdf
+
+
+# ==========================================
+# 2. 메인 UI 및 데이터 분석
+# ==========================================
+header_col1, header_col2 = st.columns([1.5, 1])
+
+with header_col1:
+    st.markdown("<br><h2 style='margin-bottom: 0;'>도시·군기본계획 도시공간구조</h2><h2 style='margin-top: 0;'>설정 자동화 시스템</h2>", unsafe_allow_html=True)
+
+with header_col2:
+    st.markdown("##### 분석범위선택")
+    hc1, hc2 = st.columns(2)
+    with hc1:
+        selected_sido = st.selectbox("• 시도 선택", list(SIDO_MAP.keys()), index=5)
+        sido_code = SIDO_MAP[selected_sido]
+        sigungu_dict = get_cached_sigungu_list(sido_code)
+        selected_sigungu_name = st.selectbox("• 시군구 선택", list(sigungu_dict.keys()))
+    with hc2:
+        target_year = st.selectbox("• 기준년도", ["2025", "2024", "2023", "2022", "2021", "2020"], index=2)
+        future_year = st.selectbox("• 목표년도", ["2040", "2035", "2030", "2045", "2050"])
+
+st.markdown("<hr style='border: 1px solid #4A7CB6;'>", unsafe_allow_html=True)
+
+if 'analysis_done_A' not in st.session_state: st.session_state['analysis_done_A'] = False
+if 'analysis_done_B' not in st.session_state: st.session_state['analysis_done_B'] = False
+if 'analysis_done_C' not in st.session_state: st.session_state['analysis_done_C'] = False
+
+col_a, col_b = st.columns(2)
+
+# --- Step A: 정량 분석 ---
+with col_a:
+    ac1, ac2 = st.columns([2.5, 1])
+    ac1.markdown("#### A.[현재 : (정량)중심지 현황]")
+    btn_a = ac2.button("분석 시작", key="btn_a", use_container_width=True, type="primary")
+    
+    st.markdown("**중심지지수 산출 가중치 설정**")
+    w1, w2 = st.columns(2)
+    with w1:
+        w_pop = st.number_input("• 인구", value=1.0, step=0.1, min_value=0.0)
+        w_biz = st.number_input("• 사업체수", value=1.0, step=0.1, min_value=0.0)
+        w_worker = st.number_input("• 종사자수", value=1.0, step=0.1, min_value=0.0)
+    with w2:
+        w_zone1 = st.number_input("• 중심상업지역 비율", value=1.0, step=0.1, min_value=0.0)
+        w_zone2 = st.number_input("• 일반상업지역 비율", value=1.0, step=0.1, min_value=0.0)
+        w_zone3 = st.number_input("• 근린상업지역 비율", value=1.0, step=0.1, min_value=0.0)
+        w_zone4 = st.number_input("• 준주거지역 비율", value=1.0, step=0.1, min_value=0.0)
+        
+    weights_map = {"인구(명)": w_pop, "사업체(수)": w_biz, "종사자(수)": w_worker, "중심상업(%)": w_zone1, "일반상업(%)": w_zone2, "근린상업(%)": w_zone3, "준주거(%)": w_zone4}
+
+    if btn_a:
+        progress_text = "통계청 인증 및 분석 준비 중..."
+        my_bar = st.progress(0, text=progress_text)
+        
+        sgis_token = get_sgis_token()
+        if not sgis_token:
+            st.error("API 키가 올바르게 설정되지 않았습니다.")
+            st.stop()
+            
+        target_codes = sigungu_dict[selected_sigungu_name]
+        
+        my_bar.progress(20, text="[1/4] 통계청 행정동 경계 및 데이터 수집 중...")
+        dong_gdf = get_sgis_dong(target_codes, target_year, sgis_token)
+        pop_dict, biz_dict, worker_dict = get_sgis_stats(dong_gdf, target_year, sgis_token)
+        dong_gdf['adm_cd'] = dong_gdf['adm_cd'].astype(str)
+        dong_gdf['dong_area_sqm'] = dong_gdf.geometry.area
+        dong_area_dict = dict(zip(dong_gdf['adm_cd'], dong_gdf['dong_area_sqm']))
+        dong_3857 = dong_gdf.to_crs(epsg=3857)
+    
+        my_bar.progress(50, text="[2/4] 국토부 용도지역 데이터 병합 중...")
+        zoning_list = []
+        for idx, row in dong_3857.iterrows():
+            b = row.geometry.bounds 
+            zdf = get_vworld_zoning_bbox(b[0], b[1], b[2], b[3], VWORLD_KEY)
+            if not zdf.empty: zoning_list.append(zdf)
+                
+        zoning_gdf = pd.concat(zoning_list, ignore_index=True) if zoning_list else gpd.GeoDataFrame()
+        target_mapping = {'UQA210': '중심상업', 'UQA220': '일반상업', 'UQA230': '근린상업', 'UQA130': '준주거'}
+        if not zoning_gdf.empty:
+            code_col = 'ucode' if 'ucode' in zoning_gdf.columns else [c for c in zoning_gdf.columns if 'code' in c.lower() or 'cde' in c.lower()][0]
+            zoning_gdf = zoning_gdf[zoning_gdf[code_col].isin(target_mapping.keys())]
+            zoning_gdf['target_zone'] = zoning_gdf[code_col].map(target_mapping)
+            zoning_gdf['geom_wkt'] = zoning_gdf.geometry.to_wkt()
+            zoning_gdf = zoning_gdf.drop_duplicates(subset=['geom_wkt']).drop(columns=['geom_wkt'])
+        
+        my_bar.progress(80, text="[3/4] 공간 연산 중...")
+        zoning_gdf = zoning_gdf.to_crs(epsg=5179) if not zoning_gdf.empty else zoning_gdf
+        dong_gdf['geometry'] = dong_gdf.geometry.buffer(0)
+        if not zoning_gdf.empty: zoning_gdf['geometry'] = zoning_gdf.geometry.buffer(0)
+        
+        intersected = gpd.overlay(dong_gdf, zoning_gdf, how='intersection') if not zoning_gdf.empty else gpd.GeoDataFrame()
+        if not intersected.empty:
+            intersected['area_sqm'] = intersected.geometry.area
+            summary = intersected.groupby(['adm_cd', 'target_zone'])['area_sqm'].sum().reset_index()
+            pivot_df = summary.pivot(index='adm_cd', columns='target_zone', values='area_sqm').fillna(0)
+        else:
+            pivot_df = pd.DataFrame()
+            
+        all_codes = dong_gdf['adm_cd'].unique()
+        pivot_df = pivot_df.reindex(all_codes, fill_value=0.0)
+        pivot_df['★동전체면적'] = pivot_df.index.map(dong_area_dict).fillna(0)
+        
+        my_bar.progress(95, text="[4/4] 중심지 지수 산출 중...")
+        final_rows = []
+        for idx, row in dong_gdf.iterrows():
+            code = row['adm_cd']
+            name_parts = str(row['adm_nm']).split()
+            sido = name_parts[0] if len(name_parts) > 0 else "-"
+            sigungu = name_parts[1] if len(name_parts) > 1 else "-"
+            dong = name_parts[-1] if len(name_parts) > 0 else "-"
+            if len(name_parts) >= 4 and name_parts[1].endswith("시") and name_parts[2].endswith("구"):
+                sigungu, dong = name_parts[1], f"{name_parts[2]} {name_parts[-1]}"
+                
+            row_data = {"adm_cd": code, "시도": sido, "시군구": sigungu, "행정동": dong,
+                        "인구(명)": pop_dict.get(code, 0), "사업체(수)": biz_dict.get(code, 0), "종사자(수)": worker_dict.get(code, 0)}
+            for zone in target_mapping.values():
+                area = pivot_df.loc[code, zone] if zone in pivot_df.columns else 0.0
+                ratio = (area / pivot_df.loc[code, '★동전체면적']) * 100 if pivot_df.loc[code, '★동전체면적'] > 0 else 0.0
+                row_data[f"{zone}(㎡)"] = round(area, 2)
+                row_data[f"{zone}(%)"] = round(ratio, 2)
+            final_rows.append(row_data)
+            
+        final_df = pd.DataFrame(final_rows)
+        norm_cols = ["인구(명)", "사업체(수)", "종사자(수)", "중심상업(%)", "일반상업(%)", "근린상업(%)", "준주거(%)"]
+        norm_df = final_df.copy()
+        for col in norm_cols:
+            min_val, max_val = norm_df[col].min(), norm_df[col].max()
+            norm_df[f"{col}_정규화"] = 0.0 if max_val == min_val else round(((norm_df[col] - min_val) / (max_val - min_val)) * weights_map[col], 4)
+                
+        scaled_cols = [f"{col}_정규화" for col in norm_cols]
+        norm_df["★중심지_지수(합산)"] = norm_df[scaled_cols].sum(axis=1).round(4)
+        norm_df = norm_df.sort_values(by="★중심지_지수(합산)", ascending=False).reset_index(drop=True)
+        
+        st.session_state['dong_gdf'] = dong_gdf
+        st.session_state['norm_df'] = norm_df
+        st.session_state['export_raw_df'] = final_df.drop(columns=["adm_cd"])
+        st.session_state['display_norm_df'] = norm_df.drop(columns=["adm_cd"])[["시도", "시군구", "행정동"] + scaled_cols + ["★중심지_지수(합산)"]]
+        st.session_state['result_sido'] = selected_sido
+        st.session_state['result_sigungu'] = selected_sigungu_name
+        st.session_state['result_year'] = target_year
+        st.session_state['analysis_done_A'] = True
+        
+        my_bar.progress(100, text="✨ A단계 정량 분석 완료!")
+        st.success("정량적 현황 데이터 산출이 완료되었습니다!")
+
+# --- Step B: 정성 분석 ---
+with col_b:
+    bc1, bc2 = st.columns([2.5, 1])
+    bc1.markdown("#### B.[미래 : (정성)도시공간구조 변화]")
+    btn_b = bc2.button("분석 시작", key="btn_b", use_container_width=True, type="primary")
+    
+    st.markdown("**분석 AI모델 & 반영사항**")
+    b1, b2 = st.columns(2)
+    with b1:
+        st.markdown("<div style='font-size: 14px;'>분석 AI모델</div>", unsafe_allow_html=True)
+        selected_ai_model_qual = st.radio("AI모델 선택", 
+            ["GEMINI 2.5 Flash", "GEMINI 2.5 Pro"], 
+            key="qual_model", label_visibility="collapsed")
+    with b2:
+        st.markdown("<div style='font-size: 14px;'>반영사항</div>", unsafe_allow_html=True)
+        use_plan = st.checkbox("상위및관련계획", value=True)
+        use_adj = st.checkbox("인접 시·군 공간구조", value=True)
+        use_policy = st.checkbox("지역현안사항", value=True)
+        use_deep_research = st.checkbox("- deep research 반영", value=True)
+
+    if btn_b:
+        with st.spinner("문서를 읽고 현황 분석 요약본을 작성 중입니다... (약 1분 소요)"):
+            
+            plan_text = read_folder_documents("01. 상위계획") if use_plan else "반영안함"
+            adj_text = read_folder_documents("02. 타지자체 도시·군기본계획") if use_adj else "반영안함"
+            
+            if use_policy:
+                policy_text = read_folder_documents("03. 지역정책사항")
+                if not policy_text.strip() and use_deep_research:
+                    policy_instruction = f"제공된 지역정책 자료가 없습니다. 당신의 자체 지식 데이터베이스를 활용하여 심층 리서치(Deep Research)를 수행하고, '{selected_sido} {selected_sigungu_name}'의 최신 주요 지역 현안 및 이슈 사항을 직접 도출하여 반영하십시오."
+                elif not policy_text.strip():
+                    policy_instruction = "반영안함"
+                else:
+                    policy_instruction = policy_text
+            else:
+                policy_instruction = "반영안함"
+
+            qual_prompt = f"""
+            작업 목표: [{selected_sido} {selected_sigungu_name}]의 정성적 현황 시사점을 분석하여 공공기관용 요약 보고서를 작성합니다.
+
+            엄격한 규칙:
+            1. "안녕하십니까", "제가 분석하겠습니다", "20년 경력의..." 와 같은 대화형 문구와 인사말을 **절대 사용하지 마십시오.**
+            2. 문장 구조는 '~함.', '~임.', '~할 것임.' 등 명사형 종결어미 형태의 **개조식(Bullet point) 문장**으로만 작성하십시오.
+            3. 분석가의 주관적 감상이나 메타 발언(수치 지표 배제 등)을 일절 제외하고 순수하게 행정 보고서의 핵심 팩트와 시사점 내용만을 직관적으로 서술하십시오.
+            4. 아래 4개의 목차를 반드시 작성하되, 각 목차의 시작 지점에 구분자 `===SECTION_1===`, `===SECTION_2===`, `===SECTION_3===`, `===SECTION_4===`를 정확히 기입하십시오. (다른 텍스트 없이 구분자만 단독 줄에 작성)
+
+            [1. 상위계획 및 관련계획 방향]
+            {plan_text}
+
+            [2. 인접 지자체 공간구조 연계 사항]
+            {adj_text}
+            
+            [3. 지역 정책 사항]
+            {policy_instruction}
+            =============================
+
+            [최종 출력 목차 지시사항 및 구분별 작성 내용]
+            ===SECTION_1===
+            1. 상위 및 관련계획 요약 (참고한 계획별 주요 내용 및 공간구조 방향 시사점)
+            ===SECTION_2===
+            2. 인접 시·군 공간구조 요약 (참고한 인접 지자체 계획별 주요 내용 및 연계 시사점)
+            ===SECTION_3===
+            3. 지역현안사항 요약 (개발사업(택지, 산업단지 등), 교통 등 명확한 하위 카테고리를 분류하여 작성)
+            ===SECTION_4===
+            4. 종합 결과 (위 1~3번 내용을 종합한 통합 현황 진단 보고서 작성)
+            """
+            
+            model_name = "models/gemini-2.5-flash" if "Flash" in selected_ai_model_qual else "models/gemini-2.5-pro"
+            result_qual = get_gemini_response(qual_prompt, [], GEMINI_API_KEY, model_override=model_name)
+            
+            st.session_state['qual_report'] = result_qual
+            st.session_state['analysis_done_B'] = True
+            st.success("✨ B단계 정성적 현황 분석이 완료되었습니다!")
+
+st.markdown("<br><hr>", unsafe_allow_html=True)
+
+# ==========================================
+# 🚀 Step C: 최종 종합 도출 UI
+# ==========================================
+cc1, cc2 = st.columns([5, 1])
+cc1.markdown("#### C. 최종 종합 도시공간구조 구상 (A+B)")
+btn_c = cc2.button("분석 시작", key="btn_c", use_container_width=True, type="primary")
+
+if btn_c:
+    if not (st.session_state.get('analysis_done_A') and st.session_state.get('analysis_done_B')):
+        st.warning("⚠️ C단계를 진행하려면 먼저 상단의 A단계(정량)와 B단계(정성) 분석을 모두 완료해야 합니다!")
+    else:
+        with st.spinner("AI 수석 도시계획가가 종합 분석을 진행합니다... (약 1분 소요)"):
+            
+            sample_text = read_folder_documents("00. 샘플")
+            top_zones = st.session_state['display_norm_df'].head(15).to_csv(index=False)
+            qual_summary = st.session_state['qual_report']
+            
+            ai_prompt = f"""
+            작업 목표: [{st.session_state['result_sido']} {st.session_state['result_sigungu']}]의 {future_year}년 목표 미래 도시공간구조안(도심, 부도심, 지역중심 설정 등)을 도출하는 공공기관용 종합 보고서를 작성합니다.
+
+            엄격한 규칙:
+            1. "수석 도시계획가로서...", "본 보고서는...", "분석 결과입니다" 등의 대화형 인사말과 서론은 **절대 사용하지 마십시오.**
+            2. 문장 구조는 '~함.', '~임.', '~할 것임.' 등 명사형 또는 '-(으)ㅁ/기'로 끝나는 **개조식 객관적 문체**로만 작성하십시오.
+            3. 당신의 AI 정체성(지식 기반 활용 등)에 대한 언급을 일절 금지합니다.
+
+            🚨 [가장 중요한 엄수 사항: 00. 샘플의 용도 제한] 🚨
+            아래 제공되는 [00. 샘플]은 오직 '보고서의 목차 구조 및 논리 전개 방식'을 흉내 내기 위한 용도입니다. 
+            샘플의 특정 도시 이름, 구체적 구상안 등의 내용은 지자체가 다르므로 절대 본 결과물에 포함하지 마십시오.
+
+            =============================
+            [00. 작성 스타일 벤치마킹 샘플 (형식만 참고할 것! 내용 반영 금지!)]
+            {sample_text[:4000]}
+            =============================
+
+            자료 1과 자료 2의 내용만을 결합하여 작성하십시오:
+
+            [1. 정량적 분석 결과 (현재 중심지 지수 상위 15개 행정동 요약)]
+            {top_zones}
+
+            [2. 정성적 분석 전문가 요약본]
+            {qual_summary}
+            =============================
+
+            [최종 출력 목차 지시사항]
+            1. 현황 및 여건 분석 종합 (정량지수와 정성분석의 시사점 융합)
+            2. 미래 도시공간구조 개편의 기본방향 (인접 지자체 연계성 강점 포함)
+            3. 공간구조 대안 설정 및 최종안 도출 (도심-부도심 등 구체적인 행정동 위계 명시)
+            4. 중심지별 육성(특화) 방안
+            """
+            
+            # Using the Pro model for the final comprehensive synthesis by default (or fetching from fallback)
+            model_name = "models/gemini-2.5-pro"
+            result_report = get_gemini_response(ai_prompt, [], GEMINI_API_KEY, model_override=model_name)
+            
+            st.session_state['generated_report'] = result_report
+            st.session_state['analysis_done_C'] = True
+            st.success("✨ C단계 최총 종합 구상이 도출되었습니다!")
+
+st.markdown("<hr style='border: 2px solid #ddd; margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
+
+# ==========================================
+# 📊 분석 결과 탭 (A / B / C 파트)
+# ==========================================
+
+# A, B, C 메인 섹션 라디오 버튼 (가로형)
+main_tab = st.radio("분석 결과 확인", ["A. 정량 분석 결과", "B. 정성 분석 요약", "C. 최종 종합 구상"], horizontal=True, label_visibility="collapsed")
+
+if main_tab == "A. 정량 분석 결과":
+    if not st.session_state.get('analysis_done_A'):
+        st.info("A단계(정량) 분석을 먼저 실행해 주세요.")
+    else:
+        t_a1, t_a2 = st.tabs(["1. 항목별 주요 내용 요약", "2. 중심지지수 종합 결과"])
+        
+        with t_a1:
+            st.markdown("### 📊 분석 항목별 핵심 지표 현황")
+            req_item = st.selectbox("조회할 세부 지표 선택:", list(MAP_COLORS.keys()), format_func=lambda x: MAP_COLORS[x][1], key="a1_select")
+            
+            # Map generation and Table
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.markdown(f"**[{MAP_COLORS[req_item][1]}] 상위 10개 행정동**")
+                # Need to find the un-normalized column name for display if available, but let's just sort by the selected normalized col
+                # or actually, just show the selected metric column
+                original_col_name = req_item.replace('_정규화', '') if '_정규화' in req_item else req_item
+                display_cols = ['행정동', original_col_name] if original_col_name in st.session_state['display_norm_df'].columns else ['행정동', req_item]
+                top10_df = st.session_state['display_norm_df'].sort_values(by=req_item, ascending=False).head(10)[display_cols]
+                top10_df.index = range(1, 11)
+                st.dataframe(top10_df, use_container_width=True)
+                
+            with c2:
+                map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'], on='adm_cd')
+                fig, ax = plt.subplots(figsize=(6, 6))
+                st.session_state['dong_gdf'].plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
+                map_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.6})
+                
+                # Annotation (행정동명 표기)
+                map_gdf['center'] = map_gdf.geometry.centroid
+                for idx, row in map_gdf.iterrows():
+                    ax.annotate(text=row['행정동'], xy=(row['center'].x, row['center'].y),
+                                horizontalalignment='center', fontsize=7, color='black',
+                                path_effects=[patheffects.withStroke(linewidth=2, foreground='white')])
+                
+                ax.set_axis_off()
+                ax.set_title(f"🗺️ {MAP_COLORS[req_item][1]} 분포도", fontsize=14, pad=15)
+                st.pyplot(fig)
+                
+        with t_a2:
+            st.markdown("### 🏆 정량적 중심지지수 최종 종합 결과")
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.markdown("**[최종 중심지지수 (합산)] 상위 10개 행정동**")
+                final_top10 = st.session_state['display_norm_df'].sort_values(by="★중심지_지수(합산)", ascending=False).head(10)[['행정동', '★중심지_지수(합산)']]
+                final_top10.index = range(1, 11)
+                st.dataframe(final_top10, use_container_width=True)
+                
+                st.markdown(f"**💡 핵심 시사점 (요약):**")
+                st.info(f"선택하신 지역({st.session_state['result_sigungu']}) 내에서 가장 높은 중심지 지수를 기록한 곳은 **'{final_top10.iloc[0]['행정동']}'** 이며, 이어 **'{final_top10.iloc[1]['행정동']}'**, **'{final_top10.iloc[2]['행정동']}'** 순으로 나타났습니다. 이는 설정된 개별 지표 및 가중치 조건 하에서 해당 지역들이 가장 핵심적인 도심/부도심 물리적 위상을 지니고 있음을 방증합니다.")
+            with c2:
+                map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'], on='adm_cd')
+                fig, ax = plt.subplots(figsize=(6, 6))
+                st.session_state['dong_gdf'].plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
+                map_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.6})
+                
+                # Annotation (행정동명 표기)
+                map_gdf['center'] = map_gdf.geometry.centroid
+                for idx, row in map_gdf.iterrows():
+                    if row["★중심지_지수(합산)"] > 0: # 0점인 외곽지역 표시 생략 등도 가능
+                        ax.annotate(text=row['행정동'], xy=(row['center'].x, row['center'].y),
+                                    horizontalalignment='center', fontsize=8, color='black',
+                                    path_effects=[patheffects.withStroke(linewidth=2, foreground='white')])
+                
+                ax.set_axis_off()
+                ax.set_title("🗺️ 최종 종합 중심지지수 분포 시각화", fontsize=14, pad=15)
+                st.pyplot(fig)
+
+elif main_tab == "B. 정성 분석 요약":
+    if not st.session_state.get('analysis_done_B'):
+         st.info("B단계(정성) 분석을 먼저 실행해 주세요.")
+    else:
+        t_b1, t_b2, t_b3, t_b4 = st.tabs(["상위 및 관련계획", "인접 시·군 공간구조", "지역현안사항", "종합"])
+        
+        qual_report = st.session_state['qual_report']
+        import re
+        sections = re.split(r'===SECTION_\d+===', qual_report)
+        sec1 = sections[1].strip() if len(sections) > 1 else "데이터를 파싱할 수 없습니다. (전체 요약 탭을 확인하세요)"
+        sec2 = sections[2].strip() if len(sections) > 2 else "데이터를 파싱할 수 없습니다."
+        sec3 = sections[3].strip() if len(sections) > 3 else "데이터를 파싱할 수 없습니다."
+        sec4 = sections[4].strip() if len(sections) > 4 else qual_report # Fallback to full report if parsing fails completely
+        
+        with t_b1:
+            st.markdown("### 1. 상위 및 관련계획")
+            st.markdown(sec1)
+        with t_b2:
+            st.markdown("### 2. 인접 시·군 공간구조")
+            st.markdown(sec2)
+        with t_b3:
+            st.markdown("### 3. 지역현안사항")
+            st.markdown(sec3)
+        with t_b4:
+            st.markdown("### 📝 정성적 파일 현황 분석 종합")
+            st.markdown(sec4)
+
+elif main_tab == "C. 최종 종합 구상":
+    if not st.session_state.get('analysis_done_C'):
+         st.info("C단계 최종 종합 분석을 먼저 실행해 주세요. (A, B단계 선행 필수)")
+    else:
+        t_c1, t_c2 = st.tabs(["총괄보고서", "구상도"])
+        with t_c1:
+            st.markdown("### 🏛️ [C] 최종 종합 도출 보고서")
+            st.markdown(st.session_state['generated_report'])
+            
+            st.download_button("📥 도출된 공간구조 종합 보고서 다운로드", 
+                               data=st.session_state['generated_report'], 
+                               file_name=f"{st.session_state['result_sido']}_미래공간구조_종합구상안.txt", 
+                               mime="text/plain")
+        with t_c2:
+            st.markdown("**(차후 업데이트 예정)** AI 기반 구상도 자동 생성/시각화 영역")
+
+# ==========================================
+# 4. AI 개발 어시스턴트 통합
+# ==========================================
+st.markdown("<br><br>", unsafe_allow_html=True)
+st.markdown("---")
+with st.expander("💬 AI 개발 어시스턴트", expanded=False):
+    if not GEMINI_API_KEY or GEMINI_API_KEY.strip() == "":
+        st.warning("상단 설정에 Gemini API 키를 입력하세요.")
+    else:
+        if "messages" not in st.session_state:
+            st.session_state.messages = [{"role": "assistant", "content": "안녕하세요! 궁금한 점이 있으면 물어보세요."}]
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]): st.markdown(msg["content"])
+        if prompt := st.chat_input("질문을 입력하세요..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"): st.markdown(prompt)
+            with st.chat_message("assistant"):
+                history = st.session_state.messages[:-1]
+                response_text = get_gemini_response(prompt, history, GEMINI_API_KEY)
+                st.markdown(response_text)
+                st.session_state.messages.append({"role": "assistant", "content": response_text})
