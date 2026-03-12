@@ -34,6 +34,17 @@ SGIS_SECRET = os.getenv("SGIS_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # ==========================================================
 
+with st.sidebar:
+    st.markdown("### 📁 B단계 참고 문서 업로드")
+    st.info("웹 배포 환경에서는 이 곳에 직접 파일을 업로드해주세요. (다중 업로드 가능)")
+    
+    st.markdown("**1. 상위계획**")
+    uploaded_plan_files = st.file_uploader("상위계획 문서 업로드 (PDF, TXT)", type=['pdf', 'txt'], accept_multiple_files=True, key="upload_plan")
+    
+    st.markdown("**2. 인접지자체 도시·군기본계획**")
+    uploaded_adj_files = st.file_uploader("인접지자체 계획 문서 업로드 (PDF, TXT)", type=['pdf', 'txt'], accept_multiple_files=True, key="upload_adj")
+    st.markdown("---")
+
 # (이 아래부터는 기존의 SIDO_MAP 등 원래 코드가 그대로 이어지면 됩니다!)
 
 SIDO_MAP = {
@@ -147,6 +158,28 @@ def read_folder_documents(folder_name):
                         text_content += f.read() + "\n"
                 except Exception:
                     pass
+    return text_content
+
+def extract_text_from_upload(uploaded_files):
+    text_content = ""
+    if not uploaded_files:
+        return ""
+    
+    for file in uploaded_files:
+        if file.name.lower().endswith('.pdf'):
+            try:
+                reader = PyPDF2.PdfReader(file)
+                for page in reader.pages:
+                    extracted = page.extract_text()
+                    if extracted:
+                        text_content += extracted + "\n"
+            except Exception:
+                pass
+        elif file.name.lower().endswith('.txt'):
+            try:
+                text_content += file.getvalue().decode('utf-8') + "\n"
+            except Exception:
+                pass
     return text_content
 
 # ==========================================
@@ -423,9 +456,15 @@ with col_b:
 
     if btn_b:
         with st.spinner("문서를 읽고 현황 분석 요약본을 작성 중입니다... (약 1분 소요)"):
-            
-            plan_text = read_folder_documents("01. 상위계획") if use_plan else "반영안함"
-            adj_text = read_folder_documents("02. 타지자체 도시·군기본계획") if use_adj else "반영안함"
+            if use_plan:
+                plan_text = extract_text_from_upload(uploaded_plan_files) if uploaded_plan_files else read_folder_documents("01. 상위계획")
+            else:
+                plan_text = "반영안함"
+                
+            if use_adj:
+                adj_text = extract_text_from_upload(uploaded_adj_files) if uploaded_adj_files else read_folder_documents("02. 타지자체 도시·군기본계획")
+            else:
+                adj_text = "반영안함"
             
             if use_policy:
                 policy_text = read_folder_documents("03. 지역정책사항")
