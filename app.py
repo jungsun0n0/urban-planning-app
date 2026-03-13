@@ -39,6 +39,13 @@ elif font_name not in installed_fonts:
 plt.rcParams['font.family'] = font_name
 plt.rcParams['axes.unicode_minus'] = False
 
+# 고정 폰트 객체 생성 (Windows 환경에서 깨짐 방지용)
+custom_font_path = 'C:/Windows/Fonts/malgun.ttf'
+if platform.system() == 'Windows' and os.path.exists(custom_font_path):
+    custom_fontprops = fm.FontProperties(fname=custom_font_path)
+else:
+    custom_fontprops = fm.FontProperties(family=font_name)
+
 # ==========================================================
 # [설정] 환경변수에서 API 키 안전하게 불러오기! (코드에 키 노출 X)
 # ==========================================================
@@ -667,18 +674,29 @@ if main_tab == "A. 정량 분석 결과":
                 st.dataframe(top10_df, use_container_width=True)
                 
             with c2:
-                map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'], on='adm_cd')
-                fig, ax = plt.subplots(figsize=(6, 6))
-                st.session_state['dong_gdf'].plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                map_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.4})
+                # `st.session_state['dong_gdf']`에는 'adm_cd', 'geometry' 등이 있고, '행정동'은 `norm_df`에 존재.
+                # merge 시 norm_df 전체 혹은 필요한 컬럼을 확실히 가져옴
+                map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'][['adm_cd', '행정동', req_item]], on='adm_cd')
+                fig, ax = plt.subplots(figsize=(8, 8))
                 
-                # Annotation (행정동명 표기) - 지시선(arrowprops) 활용
-                map_gdf['rep_pt'] = map_gdf.geometry.representative_point()
-                for i, (idx, row) in enumerate(map_gdf.iterrows()):
-                    # 각도를 137.5도(황금각)씩 주어 텍스트 위치를 주변으로 둥글게 분산
+                # 섬(도서) 분리 로직 (인천 - 옹진군, 신안군 등)
+                far_islands = ["백령면", "대청면", "연평면", "흑산면"]
+                island_mask = map_gdf['행정동'].isin(far_islands)
+                
+                main_gdf = map_gdf[~island_mask]
+                island_gdf = map_gdf[island_mask]
+                
+                # 메인 맵 그리기
+                main_gdf_bounds = main_gdf.copy()
+                main_gdf.plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
+                main_plot = main_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.3, 'pad': 0.02, 'aspect': 30})
+                
+                # 메인 영역 라벨링 (지시선 포함)
+                main_gdf['rep_pt'] = main_gdf.geometry.representative_point()
+                for i, (idx, row) in enumerate(main_gdf.iterrows()):
                     angle = (i * 137.5) % 360
                     rad = math.radians(angle)
-                    offset_dist = 25 # 중심에서 25 포인트 띄우기
+                    offset_dist = 25 
                     
                     ax.annotate(
                         text=row['행정동'], 
@@ -690,12 +708,53 @@ if main_tab == "A. 정량 분석 결과":
                         fontsize=8, 
                         color='black',
                         path_effects=[patheffects.withStroke(linewidth=2, foreground='white')],
-                        arrowprops=dict(arrowstyle="-", color="black", lw=0.6, alpha=0.6)
+                        arrowprops=dict(arrowstyle="-", color="black", lw=0.6, alpha=0.6),
+                        fontproperties=custom_fontprops
                     )
+                
+                # 원거리 도서지역 (삽도 - Inset Map) 처리
+                if not island_gdf.empty:
+                    # 메인 맵의 경계(Zoom)를 내륙(+근거리 섬) 위주로 맞춰줌
+                    minx, miny, maxx, maxy = main_gdf.total_bounds
+                    # 여백 5% 반영
+                    dx = maxx - minx
+                    dy = maxy - miny
+                    ax.set_xlim(minx - dx*0.05, maxx + dx*0.05)
+                    ax.set_ylim(miny - dy*0.05, maxy + dy*0.05)
+                
+                    # 삽도 축(Axes) 생성: 좌측 상단 여백에 작게!
+                    ax_inset = ax.inset_axes([0.02, 0.65, 0.25, 0.30])
+                    # ax_inset 보더 박스 설정
+                    for spine in ax_inset.spines.values():
+                        spine.set_edgecolor('gray')
+                        spine.set_linewidth(1)
+                    
+                    # 삽도에 도서지역 그리기 (메인과 동일한 colormap)
+                    vmin, vmax = map_gdf[req_item].min(), map_gdf[req_item].max()
+                    island_gdf.plot(ax=ax_inset, facecolor='lightgray', edgecolor='white', linewidth=0.8)
+                    island_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax_inset, legend=False, edgecolor='black', linewidth=0.5, vmin=vmin, vmax=vmax)
+                    
+                    # 삽도 라벨링
+                    island_gdf['rep_pt'] = island_gdf.geometry.representative_point()
+                    for i, (idx, row) in enumerate(island_gdf.iterrows()):
+                        ax_inset.annotate(
+                            text=row['행정동'], 
+                            xy=(row['rep_pt'].x, row['rep_pt'].y),
+                            xytext=(0, 10),
+                            textcoords='offset points',
+                            horizontalalignment='center', 
+                            verticalalignment='center',
+                            fontsize=7, 
+                            color='black',
+                            path_effects=[patheffects.withStroke(linewidth=1.5, foreground='white')],
+                            fontproperties=custom_fontprops
+                        )
+                    ax_inset.set_xticks([])
+                    ax_inset.set_yticks([])
                 
                 ax.set_axis_off()
                 # 이모지 제거하여 폰트 깨짐 방지
-                ax.set_title(f"{MAP_COLORS[req_item][1]} 분포도", fontsize=14, pad=15, fontweight='bold')
+                ax.set_title(f"{MAP_COLORS[req_item][1]} 분포도", fontsize=14, pad=15, fontweight='bold', fontproperties=custom_fontprops)
                 st.pyplot(fig)
                 
         with t_a2:
@@ -710,15 +769,25 @@ if main_tab == "A. 정량 분석 결과":
                 st.markdown(f"**💡 핵심 시사점 (요약):**")
                 st.info(f"선택하신 지역({st.session_state['result_sigungu']}) 내에서 가장 높은 중심지 지수를 기록한 곳은 **'{final_top10.iloc[0]['행정동']}'** 이며, 이어 **'{final_top10.iloc[1]['행정동']}'**, **'{final_top10.iloc[2]['행정동']}'** 순으로 나타났습니다. 이는 설정된 개별 지표 및 가중치 조건 하에서 해당 지역들이 가장 핵심적인 도심/부도심 물리적 위상을 지니고 있음을 방증합니다.")
             with c2:
-                map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'], on='adm_cd')
-                fig, ax = plt.subplots(figsize=(6, 6))
-                st.session_state['dong_gdf'].plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                map_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.4})
+                # `st.session_state['dong_gdf']`에는 'adm_cd', 'geometry' 등이 있고, '행정동'은 `norm_df`에 존재.
+                map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'][['adm_cd', '행정동', '★중심지_지수(합산)']], on='adm_cd')
+                fig, ax = plt.subplots(figsize=(8, 8))
                 
-                # Annotation (행정동명 표기) - 지시선(arrowprops) 활용
-                map_gdf['rep_pt'] = map_gdf.geometry.representative_point()
-                for i, (idx, row) in enumerate(map_gdf.iterrows()):
-                    if row["★중심지_지수(합산)"] > 0: # 0점인 외곽지역 표시 생략 등도 가능
+                # 동일한 섬 분리 로직 적용
+                far_islands = ["백령면", "대청면", "연평면", "흑산면"]
+                island_mask = map_gdf['행정동'].isin(far_islands)
+                
+                main_gdf = map_gdf[~island_mask]
+                island_gdf = map_gdf[island_mask]
+
+                # 메인 맵 그리기
+                main_gdf.plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
+                main_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.3, 'pad': 0.02, 'aspect': 30})
+                
+                # 메인 라벨링
+                main_gdf['rep_pt'] = main_gdf.geometry.representative_point()
+                for i, (idx, row) in enumerate(main_gdf.iterrows()):
+                    if row["★중심지_지수(합산)"] > 0:
                         angle = (i * 137.5) % 360
                         rad = math.radians(angle)
                         offset_dist = 25
@@ -733,12 +802,49 @@ if main_tab == "A. 정량 분석 결과":
                             fontsize=8, 
                             color='black',
                             path_effects=[patheffects.withStroke(linewidth=2, foreground='white')],
-                            arrowprops=dict(arrowstyle="-", color="black", lw=0.6, alpha=0.6)
+                            arrowprops=dict(arrowstyle="-", color="black", lw=0.6, alpha=0.6),
+                            fontproperties=custom_fontprops
                         )
                 
+                # 삽도(Inset Map) 생성 영역
+                if not island_gdf.empty:
+                    minx, miny, maxx, maxy = main_gdf.total_bounds
+                    dx = maxx - minx
+                    dy = maxy - miny
+                    # 삽도가 그려진다는 뜻은 전체 뷰가 과도하게 확장되지 않게 메인에 Focus를 둔다는 의미
+                    ax.set_xlim(minx - dx*0.05, maxx + dx*0.05)
+                    ax.set_ylim(miny - dy*0.05, maxy + dy*0.05)
+                    
+                    ax_inset = ax.inset_axes([0.02, 0.65, 0.25, 0.30])
+                    for spine in ax_inset.spines.values():
+                        spine.set_edgecolor('gray')
+                        spine.set_linewidth(1)
+                    
+                    vmin, vmax = map_gdf["★중심지_지수(합산)"].min(), map_gdf["★중심지_지수(합산)"].max()
+                    island_gdf.plot(ax=ax_inset, facecolor='lightgray', edgecolor='white', linewidth=0.8)
+                    island_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax_inset, legend=False, edgecolor='black', linewidth=0.5, vmin=vmin, vmax=vmax)
+                    
+                    island_gdf['rep_pt'] = island_gdf.geometry.representative_point()
+                    for i, (idx, row) in enumerate(island_gdf.iterrows()):
+                        if row["★중심지_지수(합산)"] > 0:
+                            ax_inset.annotate(
+                                text=row['행정동'], 
+                                xy=(row['rep_pt'].x, row['rep_pt'].y),
+                                xytext=(0, 10),
+                                textcoords='offset points',
+                                horizontalalignment='center', 
+                                verticalalignment='center',
+                                fontsize=7, 
+                                color='black',
+                                path_effects=[patheffects.withStroke(linewidth=1.5, foreground='white')],
+                                fontproperties=custom_fontprops
+                            )
+                    ax_inset.set_xticks([])
+                    ax_inset.set_yticks([])
+
                 ax.set_axis_off()
                 # 이모지 제거하여 폰트 깨짐 방지
-                ax.set_title("최종 종합 중심지지수 분포 시각화", fontsize=14, pad=15, fontweight='bold')
+                ax.set_title("최종 종합 중심지지수 분포 시각화", fontsize=14, pad=15, fontweight='bold', fontproperties=custom_fontprops)
                 st.pyplot(fig)
 
 elif main_tab == "B. 정성 분석 요약":
