@@ -550,14 +550,15 @@ with col_b:
             =============================
 
             [최종 출력 목차 지시사항 및 구분별 작성 내용]
+            (주의: 각 섹션 시작 부분에 '1. 상위 및 관련계획 요약' 등과 같은 대제목을 절대 쓰지 마십시오. 오직 본문(글머리 기호 내용)부터 바로 출력하십시오.)
             ===SECTION_1===
-            1. 상위 및 관련계획 요약 (참고한 계획별 주요 내용 및 공간구조 방향 시사점)
+            - 상위 및 관련계획 방향 시사점 내용부터 작성
             ===SECTION_2===
-            2. 인접 시·군 공간구조 요약 (참고한 인접 지자체 계획별 주요 내용 및 연계 시사점)
+            - 인접 시·군 공간구조 요약 시사점 내용부터 작성
             ===SECTION_3===
-            3. 지역현안사항 요약 (개발사업(택지, 산업단지 등), 교통 등 명확한 하위 카테고리를 분류하여 작성)
+            - 지역현안사항 종합 요약 내용부터 작성
             ===SECTION_4===
-            4. 종합 결과 (위 1~3번 내용을 종합한 통합 현황 진단 보고서 작성)
+            - 위 1~3번을 통합한 종합 결과 진단 내용부터 작성
             """
             
             model_name = "models/gemini-2.5-flash" if "Flash" in selected_ai_model_qual else "models/gemini-2.5-pro"
@@ -662,7 +663,7 @@ if main_tab == "A. 정량 분석 결과":
                 original_col_name = req_item.replace('_정규화', '') if '_정규화' in req_item else req_item
                 display_cols = ['행정동', original_col_name] if original_col_name in st.session_state['display_norm_df'].columns else ['행정동', req_item]
                 top10_df = st.session_state['display_norm_df'].sort_values(by=req_item, ascending=False).head(10)[display_cols]
-                top10_df.index = range(1, 11)
+                top10_df.index = range(1, len(top10_df) + 1)
                 st.dataframe(top10_df, use_container_width=True)
                 
             with c2:
@@ -703,7 +704,7 @@ if main_tab == "A. 정량 분석 결과":
             with c1:
                 st.markdown("**[최종 중심지지수 (합산)] 상위 10개 행정동**")
                 final_top10 = st.session_state['display_norm_df'].sort_values(by="★중심지_지수(합산)", ascending=False).head(10)[['행정동', '★중심지_지수(합산)']]
-                final_top10.index = range(1, 11)
+                final_top10.index = range(1, len(final_top10) + 1)
                 st.dataframe(final_top10, use_container_width=True)
                 
                 st.markdown(f"**💡 핵심 시사점 (요약):**")
