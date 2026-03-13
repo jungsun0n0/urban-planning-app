@@ -11,6 +11,8 @@ import platform
 import os
 import PyPDF2
 from dotenv import load_dotenv # ★ 금고 여는 라이브러리 추가
+import math
+import matplotlib.font_manager as fm
 
 warnings.filterwarnings('ignore')
 
@@ -19,10 +21,22 @@ load_dotenv()
 
 st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_icon="🏙️", layout="wide")
 
-if platform.system() == 'Windows':
-    plt.rcParams['font.family'] = 'Malgun Gothic'
-else:
-    plt.rcParams['font.family'] = 'AppleGothic'
+font_name = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
+installed_fonts = [f.name for f in fm.fontManager.ttflist]
+
+if platform.system() == 'Windows' and 'Malgun Gothic' not in installed_fonts:
+    try:
+        fm.fontManager.addfont('C:/Windows/Fonts/malgun.ttf')
+        font_name = 'Malgun Gothic'
+    except Exception:
+        pass
+elif font_name not in installed_fonts:
+    for fallback in ['Malgun Gothic', 'AppleGothic', 'NanumGothic', 'Gulim']:
+        if fallback in installed_fonts:
+            font_name = fallback
+            break
+
+plt.rcParams['font.family'] = font_name
 plt.rcParams['axes.unicode_minus'] = False
 
 # ==========================================================
@@ -38,11 +52,25 @@ with st.sidebar:
     st.markdown("### 📁 B단계 참고 문서 업로드")
     st.info("웹 배포 환경에서는 이 곳에 직접 파일을 업로드해주세요. (다중 업로드 가능)")
     
+    # 텍스트 추출 한도 (예: 10만 자)
+    TEXT_LIMIT = 100000
+    
     st.markdown("**1. 상위계획**")
     uploaded_plan_files = st.file_uploader("상위계획 문서 업로드 (PDF, TXT)", type=['pdf', 'txt'], accept_multiple_files=True, key="upload_plan")
     
+    if uploaded_plan_files:
+        plan_extracted = extract_text_from_upload_cached(uploaded_plan_files, "plan_text_cache")
+        if len(plan_extracted) > TEXT_LIMIT:
+            st.warning('문서 용량이 너무 큽니다. 핵심 부분만 발췌해서 올려주세요')
+    
     st.markdown("**2. 인접지자체 도시·군기본계획**")
     uploaded_adj_files = st.file_uploader("인접지자체 계획 문서 업로드 (PDF, TXT)", type=['pdf', 'txt'], accept_multiple_files=True, key="upload_adj")
+    
+    if uploaded_adj_files:
+        adj_extracted = extract_text_from_upload_cached(uploaded_adj_files, "adj_text_cache")
+        if len(adj_extracted) > TEXT_LIMIT:
+            st.warning('문서 용량이 너무 큽니다. 핵심 부분만 발췌해서 올려주세요')
+            
     st.markdown("---")
 
 # (이 아래부터는 기존의 SIDO_MAP 등 원래 코드가 그대로 이어지면 됩니다!)
@@ -86,6 +114,9 @@ def get_best_gemini_model(api_key):
 # 스트림릿 캐시를 사용하여 여러 번 불필요한 모델 목록 조회 방지 (Rate Limit 절약)
 cached_best_model = None
 
+class GeminiAPIError(Exception):
+    pass
+
 def get_gemini_response(prompt, history, api_key, model_override=None):
     global cached_best_model
     
@@ -120,13 +151,19 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
                     time.sleep(10 * (attempt + 1)) # 10초, 20초 후 재시도
                     continue
                 else:
-                    return "에러 발생! 상태코드 : 429 - AI API 사용량 또는 요청 빈도(Rate Limit) 초과입니다. 1~2분 정도 대기 후 다시 시도해주세요."
+                    raise GeminiAPIError("Too Many Requests (Rate Limit)")
             else:
-                return f"에러 발생! 상태코드: {res.status_code} - {res.text}"
+                if attempt < retries - 1:
+                    time.sleep(5)
+                    continue
+                raise GeminiAPIError(f"HTTP Error: {res.status_code}")
         except Exception as e:
-            return f"AI 서버 통신 에러 (시간 초과 등): {str(e)}"
+            if attempt < retries - 1:
+                time.sleep(5)
+                continue
+            raise GeminiAPIError(f"Connection Error: {str(e)}")
     
-    return "통신에 실패했습니다."
+    raise GeminiAPIError("통신 일시적 실패")
 
 # ==========================================
 # ★ 0-1. 지정된 폴더 안의 문서(PDF, TXT) 읽어오는 함수 추가
@@ -160,26 +197,42 @@ def read_folder_documents(folder_name):
                     pass
     return text_content
 
-def extract_text_from_upload(uploaded_files):
-    text_content = ""
+def extract_text_from_upload_cached(uploaded_files, state_key):
     if not uploaded_files:
+        if state_key in st.session_state:
+            st.session_state[state_key] = ""
+        if f"{state_key}_files" in st.session_state:
+            st.session_state[f"{state_key}_files"] = []
         return ""
     
-    for file in uploaded_files:
-        if file.name.lower().endswith('.pdf'):
-            try:
-                reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
-                    extracted = page.extract_text()
-                    if extracted:
-                        text_content += extracted + "\n"
-            except Exception:
-                pass
-        elif file.name.lower().endswith('.txt'):
-            try:
-                text_content += file.getvalue().decode('utf-8') + "\n"
-            except Exception:
-                pass
+    current_file_info = [(f.name, f.size) for f in uploaded_files]
+    
+    if state_key in st.session_state and f"{state_key}_files" in st.session_state:
+        if st.session_state[f"{state_key}_files"] == current_file_info:
+            return st.session_state[state_key]
+            
+    with st.spinner('문서를 분석하기 위해 텍스트를 추출 중입니다...'):
+        text_content = ""
+        for file in uploaded_files:
+            file.seek(0)
+            if file.name.lower().endswith('.pdf'):
+                try:
+                    reader = PyPDF2.PdfReader(file)
+                    for page in reader.pages:
+                        extracted = page.extract_text()
+                        if extracted:
+                            text_content += extracted + "\n"
+                except Exception:
+                    pass
+            elif file.name.lower().endswith('.txt'):
+                try:
+                    text_content += file.getvalue().decode('utf-8') + "\n"
+                except Exception:
+                    pass
+        
+        st.session_state[state_key] = text_content
+        st.session_state[f"{state_key}_files"] = current_file_info
+        
     return text_content
 
 # ==========================================
@@ -457,12 +510,12 @@ with col_b:
     if btn_b:
         with st.spinner("문서를 읽고 현황 분석 요약본을 작성 중입니다... (약 1분 소요)"):
             if use_plan:
-                plan_text = extract_text_from_upload(uploaded_plan_files) if uploaded_plan_files else read_folder_documents("01. 상위계획")
+                plan_text = st.session_state.get('plan_text_cache', '') if uploaded_plan_files else read_folder_documents("01. 상위계획")
             else:
                 plan_text = "반영안함"
                 
             if use_adj:
-                adj_text = extract_text_from_upload(uploaded_adj_files) if uploaded_adj_files else read_folder_documents("02. 타지자체 도시·군기본계획")
+                adj_text = st.session_state.get('adj_text_cache', '') if uploaded_adj_files else read_folder_documents("02. 타지자체 도시·군기본계획")
             else:
                 adj_text = "반영안함"
             
@@ -508,11 +561,14 @@ with col_b:
             """
             
             model_name = "models/gemini-2.5-flash" if "Flash" in selected_ai_model_qual else "models/gemini-2.5-pro"
-            result_qual = get_gemini_response(qual_prompt, [], GEMINI_API_KEY, model_override=model_name)
-            
-            st.session_state['qual_report'] = result_qual
-            st.session_state['analysis_done_B'] = True
-            st.success("✨ B단계 정성적 현황 분석이 완료되었습니다!")
+            try:
+                result_qual = get_gemini_response(qual_prompt, [], GEMINI_API_KEY, model_override=model_name)
+                
+                st.session_state['qual_report'] = result_qual
+                st.session_state['analysis_done_B'] = True
+                st.success("✨ B단계 정성적 현황 분석이 완료되었습니다!")
+            except GeminiAPIError as e:
+                st.error('분석할 문서의 양이 너무 많거나 서버 응답이 지연되었습니다. 문서 분량을 줄여서 다시 시도해 주세요.')
 
 st.markdown("<br><hr>", unsafe_allow_html=True)
 
@@ -536,14 +592,15 @@ if btn_c:
             ai_prompt = f"""
             작업 목표: [{st.session_state['result_sido']} {st.session_state['result_sigungu']}]의 {future_year}년 목표 미래 도시공간구조안(도심, 부도심, 지역중심 설정 등)을 도출하는 공공기관용 종합 보고서를 작성합니다.
 
-            엄격한 규칙:
-            1. "수석 도시계획가로서...", "본 보고서는...", "분석 결과입니다" 등의 대화형 인사말과 서론은 **절대 사용하지 마십시오.**
+            엄격한 규칙 (절대 엄수):
+            1. "네, 알겠습니다", "수석 도시계획가로서...", "본 보고서는...", "분석 결과입니다" 등의 대화형 인사말, 서론, 결론 요약 등은 **절대 출력하지 마십시오.**
             2. 문장 구조는 '~함.', '~임.', '~할 것임.' 등 명사형 또는 '-(으)ㅁ/기'로 끝나는 **개조식 객관적 문체**로만 작성하십시오.
             3. 당신의 AI 정체성(지식 기반 활용 등)에 대한 언급을 일절 금지합니다.
+            4. 오직 아래 [최종 출력 목차 지시사항]의 1번부터 4번까지의 대제목과 그 내용만 **마크다운(Markdown) 형식**으로 깔끔하게 바로 출력하십시오.
 
             🚨 [가장 중요한 엄수 사항: 00. 샘플의 용도 제한] 🚨
             아래 제공되는 [00. 샘플]은 오직 '보고서의 목차 구조 및 논리 전개 방식'을 흉내 내기 위한 용도입니다. 
-            샘플의 특정 도시 이름, 구체적 구상안 등의 내용은 지자체가 다르므로 절대 본 결과물에 포함하지 마십시오.
+            샘플의 제목, 특정 지역명(도시 이름), 구체적 구상안 등의 내용은 절대 출력물에 포함하지 마십시오. 오직 분석 대상인 [{st.session_state['result_sido']} {st.session_state['result_sigungu']}]에 맞게 작성되어야 합니다.
 
             =============================
             [00. 작성 스타일 벤치마킹 샘플 (형식만 참고할 것! 내용 반영 금지!)]
@@ -568,11 +625,14 @@ if btn_c:
             
             # Using the Pro model for the final comprehensive synthesis by default (or fetching from fallback)
             model_name = "models/gemini-2.5-pro"
-            result_report = get_gemini_response(ai_prompt, [], GEMINI_API_KEY, model_override=model_name)
-            
-            st.session_state['generated_report'] = result_report
-            st.session_state['analysis_done_C'] = True
-            st.success("✨ C단계 최총 종합 구상이 도출되었습니다!")
+            try:
+                result_report = get_gemini_response(ai_prompt, [], GEMINI_API_KEY, model_override=model_name)
+                
+                st.session_state['generated_report'] = result_report
+                st.session_state['analysis_done_C'] = True
+                st.success("✨ C단계 최총 종합 구상이 도출되었습니다!")
+            except GeminiAPIError as e:
+                st.error('분석할 문서의 양이 너무 많거나 서버 응답이 지연되었습니다. 문서 분량을 줄여서 다시 시도해 주세요.')
 
 st.markdown("<hr style='border: 2px solid #ddd; margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
 
@@ -609,17 +669,32 @@ if main_tab == "A. 정량 분석 결과":
                 map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'], on='adm_cd')
                 fig, ax = plt.subplots(figsize=(6, 6))
                 st.session_state['dong_gdf'].plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                map_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.6})
+                map_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.4})
                 
-                # Annotation (행정동명 표기)
-                map_gdf['center'] = map_gdf.geometry.centroid
-                for idx, row in map_gdf.iterrows():
-                    ax.annotate(text=row['행정동'], xy=(row['center'].x, row['center'].y),
-                                horizontalalignment='center', fontsize=7, color='black',
-                                path_effects=[patheffects.withStroke(linewidth=2, foreground='white')])
+                # Annotation (행정동명 표기) - 지시선(arrowprops) 활용
+                map_gdf['rep_pt'] = map_gdf.geometry.representative_point()
+                for i, (idx, row) in enumerate(map_gdf.iterrows()):
+                    # 각도를 137.5도(황금각)씩 주어 텍스트 위치를 주변으로 둥글게 분산
+                    angle = (i * 137.5) % 360
+                    rad = math.radians(angle)
+                    offset_dist = 25 # 중심에서 25 포인트 띄우기
+                    
+                    ax.annotate(
+                        text=row['행정동'], 
+                        xy=(row['rep_pt'].x, row['rep_pt'].y),
+                        xytext=(offset_dist * math.cos(rad), offset_dist * math.sin(rad)),
+                        textcoords='offset points',
+                        horizontalalignment='center', 
+                        verticalalignment='center',
+                        fontsize=8, 
+                        color='black',
+                        path_effects=[patheffects.withStroke(linewidth=2, foreground='white')],
+                        arrowprops=dict(arrowstyle="-", color="black", lw=0.6, alpha=0.6)
+                    )
                 
                 ax.set_axis_off()
-                ax.set_title(f"🗺️ {MAP_COLORS[req_item][1]} 분포도", fontsize=14, pad=15)
+                # 이모지 제거하여 폰트 깨짐 방지
+                ax.set_title(f"{MAP_COLORS[req_item][1]} 분포도", fontsize=14, pad=15, fontweight='bold')
                 st.pyplot(fig)
                 
         with t_a2:
@@ -637,18 +712,32 @@ if main_tab == "A. 정량 분석 결과":
                 map_gdf = st.session_state['dong_gdf'].merge(st.session_state['norm_df'], on='adm_cd')
                 fig, ax = plt.subplots(figsize=(6, 6))
                 st.session_state['dong_gdf'].plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                map_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.6})
+                map_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.4})
                 
-                # Annotation (행정동명 표기)
-                map_gdf['center'] = map_gdf.geometry.centroid
-                for idx, row in map_gdf.iterrows():
+                # Annotation (행정동명 표기) - 지시선(arrowprops) 활용
+                map_gdf['rep_pt'] = map_gdf.geometry.representative_point()
+                for i, (idx, row) in enumerate(map_gdf.iterrows()):
                     if row["★중심지_지수(합산)"] > 0: # 0점인 외곽지역 표시 생략 등도 가능
-                        ax.annotate(text=row['행정동'], xy=(row['center'].x, row['center'].y),
-                                    horizontalalignment='center', fontsize=8, color='black',
-                                    path_effects=[patheffects.withStroke(linewidth=2, foreground='white')])
+                        angle = (i * 137.5) % 360
+                        rad = math.radians(angle)
+                        offset_dist = 25
+                        
+                        ax.annotate(
+                            text=row['행정동'], 
+                            xy=(row['rep_pt'].x, row['rep_pt'].y),
+                            xytext=(offset_dist * math.cos(rad), offset_dist * math.sin(rad)),
+                            textcoords='offset points',
+                            horizontalalignment='center', 
+                            verticalalignment='center',
+                            fontsize=8, 
+                            color='black',
+                            path_effects=[patheffects.withStroke(linewidth=2, foreground='white')],
+                            arrowprops=dict(arrowstyle="-", color="black", lw=0.6, alpha=0.6)
+                        )
                 
                 ax.set_axis_off()
-                ax.set_title("🗺️ 최종 종합 중심지지수 분포 시각화", fontsize=14, pad=15)
+                # 이모지 제거하여 폰트 깨짐 방지
+                ax.set_title("최종 종합 중심지지수 분포 시각화", fontsize=14, pad=15, fontweight='bold')
                 st.pyplot(fig)
 
 elif main_tab == "B. 정성 분석 요약":
@@ -687,10 +776,10 @@ elif main_tab == "C. 최종 종합 구상":
             st.markdown("### 🏛️ [C] 최종 종합 도출 보고서")
             st.markdown(st.session_state['generated_report'])
             
-            st.download_button("📥 도출된 공간구조 종합 보고서 다운로드", 
+            st.download_button("📥 마크다운(.md) 보고서 다운로드", 
                                data=st.session_state['generated_report'], 
-                               file_name=f"{st.session_state['result_sido']}_미래공간구조_종합구상안.txt", 
-                               mime="text/plain")
+                               file_name=f"{st.session_state['result_sido']}_미래공간구조_종합구상안.md", 
+                               mime="text/markdown")
         with t_c2:
             st.markdown("**(차후 업데이트 예정)** AI 기반 구상도 자동 생성/시각화 영역")
 
@@ -712,6 +801,10 @@ with st.expander("💬 AI 개발 어시스턴트", expanded=False):
             with st.chat_message("user"): st.markdown(prompt)
             with st.chat_message("assistant"):
                 history = st.session_state.messages[:-1]
-                response_text = get_gemini_response(prompt, history, GEMINI_API_KEY)
-                st.markdown(response_text)
-                st.session_state.messages.append({"role": "assistant", "content": response_text})
+                try:
+                    response_text = get_gemini_response(prompt, history, GEMINI_API_KEY)
+                    st.markdown(response_text)
+                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                except GeminiAPIError as e:
+                    st.error('서버 응답이 지연되었습니다. 잠시 후 다시 시도해 주세요.')
+                    st.session_state.messages.append({"role": "assistant", "content": "오류: 서버 통신 실패"})
