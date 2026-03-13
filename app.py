@@ -21,6 +21,8 @@ load_dotenv()
 
 st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_icon="🏙️", layout="wide")
 
+import urllib.request
+
 font_name = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
 installed_fonts = [f.name for f in fm.fontManager.ttflist]
 
@@ -39,9 +41,19 @@ elif font_name not in installed_fonts:
 plt.rcParams['font.family'] = font_name
 plt.rcParams['axes.unicode_minus'] = False
 
-# 고정 폰트 객체 생성 (Windows 환경에서 깨짐 방지용)
-custom_font_path = 'C:/Windows/Fonts/malgun.ttf'
-if platform.system() == 'Windows' and os.path.exists(custom_font_path):
+# 고정 폰트 객체 생성 (Windows 환경 및 Linux 배포 환경에서 폰트 깨짐 완벽 방지용)
+if platform.system() == 'Windows':
+    custom_font_path = 'C:/Windows/Fonts/malgun.ttf'
+else:
+    custom_font_path = 'NanumGothic.ttf'
+    if not os.path.exists(custom_font_path):
+        try:
+            urllib.request.urlretrieve("https://github.com/naver/nanumfont/raw/master/NanumFont_TTF_ALL/NanumGothic.ttf", custom_font_path)
+            fm.fontManager.addfont(custom_font_path)
+        except Exception:
+            pass
+
+if os.path.exists(custom_font_path):
     custom_fontprops = fm.FontProperties(fname=custom_font_path)
 else:
     custom_fontprops = fm.FontProperties(family=font_name)
@@ -64,8 +76,13 @@ def read_folder_documents(folder_name):
     if not os.path.exists(folder_name):
         return ""
     
+    TEXT_LIMIT = 100000
+    
     for root, dirs, files in os.walk(folder_name):
         for file in files:
+            if len(text_content) > TEXT_LIMIT:
+                break
+            
             file_path = os.path.join(root, file)
             # PDF 파일 읽기
             if file.lower().endswith('.pdf'):
@@ -73,6 +90,8 @@ def read_folder_documents(folder_name):
                     with open(file_path, 'rb') as f:
                         reader = PyPDF2.PdfReader(f)
                         for page in reader.pages:
+                            if len(text_content) > TEXT_LIMIT:
+                                break
                             extracted = page.extract_text()
                             if extracted:
                                 text_content += extracted + "\n"
@@ -85,7 +104,7 @@ def read_folder_documents(folder_name):
                         text_content += f.read() + "\n"
                 except Exception:
                     pass
-    return text_content
+    return text_content[:TEXT_LIMIT]
 
 def extract_text_from_upload_cached(uploaded_files, state_key):
     if not uploaded_files:
@@ -102,13 +121,19 @@ def extract_text_from_upload_cached(uploaded_files, state_key):
             return st.session_state[state_key]
             
     with st.spinner('문서를 분석하기 위해 텍스트를 추출 중입니다...'):
+        TEXT_LIMIT = 100000
         text_content = ""
         for file in uploaded_files:
+            if len(text_content) > TEXT_LIMIT:
+                break
+            
             file.seek(0)
             if file.name.lower().endswith('.pdf'):
                 try:
                     reader = PyPDF2.PdfReader(file)
                     for page in reader.pages:
+                        if len(text_content) > TEXT_LIMIT:
+                            break
                         extracted = page.extract_text()
                         if extracted:
                             text_content += extracted + "\n"
@@ -120,6 +145,7 @@ def extract_text_from_upload_cached(uploaded_files, state_key):
                 except Exception:
                     pass
         
+        text_content = text_content[:TEXT_LIMIT]
         st.session_state[state_key] = text_content
         st.session_state[f"{state_key}_files"] = current_file_info
         
