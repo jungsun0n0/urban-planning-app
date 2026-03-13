@@ -55,6 +55,76 @@ SGIS_SECRET = os.getenv("SGIS_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # ==========================================================
 
+# ==========================================
+# ★ 0-1. 지정된 폴더 안의 문서(PDF, TXT) 읽어오는 함수 추가
+# ==========================================
+def read_folder_documents(folder_name):
+    text_content = ""
+    # 폴더가 없으면 빈 텍스트 반환
+    if not os.path.exists(folder_name):
+        return ""
+    
+    for root, dirs, files in os.walk(folder_name):
+        for file in files:
+            file_path = os.path.join(root, file)
+            # PDF 파일 읽기
+            if file.lower().endswith('.pdf'):
+                try:
+                    with open(file_path, 'rb') as f:
+                        reader = PyPDF2.PdfReader(f)
+                        for page in reader.pages:
+                            extracted = page.extract_text()
+                            if extracted:
+                                text_content += extracted + "\n"
+                except Exception as e:
+                    pass
+            # TXT 파일 읽기
+            elif file.lower().endswith('.txt'):
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        text_content += f.read() + "\n"
+                except Exception:
+                    pass
+    return text_content
+
+def extract_text_from_upload_cached(uploaded_files, state_key):
+    if not uploaded_files:
+        if state_key in st.session_state:
+            st.session_state[state_key] = ""
+        if f"{state_key}_files" in st.session_state:
+            st.session_state[f"{state_key}_files"] = []
+        return ""
+    
+    current_file_info = [(f.name, f.size) for f in uploaded_files]
+    
+    if state_key in st.session_state and f"{state_key}_files" in st.session_state:
+        if st.session_state[f"{state_key}_files"] == current_file_info:
+            return st.session_state[state_key]
+            
+    with st.spinner('문서를 분석하기 위해 텍스트를 추출 중입니다...'):
+        text_content = ""
+        for file in uploaded_files:
+            file.seek(0)
+            if file.name.lower().endswith('.pdf'):
+                try:
+                    reader = PyPDF2.PdfReader(file)
+                    for page in reader.pages:
+                        extracted = page.extract_text()
+                        if extracted:
+                            text_content += extracted + "\n"
+                except Exception:
+                    pass
+            elif file.name.lower().endswith('.txt'):
+                try:
+                    text_content += file.getvalue().decode('utf-8') + "\n"
+                except Exception:
+                    pass
+        
+        st.session_state[state_key] = text_content
+        st.session_state[f"{state_key}_files"] = current_file_info
+        
+    return text_content
+
 with st.sidebar:
     st.markdown("### 📁 B단계 참고 문서 업로드")
     st.info("웹 배포 환경에서는 이 곳에 직접 파일을 업로드해주세요. (다중 업로드 가능)")
@@ -172,75 +242,7 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
     
     raise GeminiAPIError("통신 일시적 실패")
 
-# ==========================================
-# ★ 0-1. 지정된 폴더 안의 문서(PDF, TXT) 읽어오는 함수 추가
-# ==========================================
-def read_folder_documents(folder_name):
-    text_content = ""
-    # 폴더가 없으면 빈 텍스트 반환
-    if not os.path.exists(folder_name):
-        return ""
-    
-    for root, dirs, files in os.walk(folder_name):
-        for file in files:
-            file_path = os.path.join(root, file)
-            # PDF 파일 읽기
-            if file.lower().endswith('.pdf'):
-                try:
-                    with open(file_path, 'rb') as f:
-                        reader = PyPDF2.PdfReader(f)
-                        for page in reader.pages:
-                            extracted = page.extract_text()
-                            if extracted:
-                                text_content += extracted + "\n"
-                except Exception as e:
-                    pass
-            # TXT 파일 읽기
-            elif file.lower().endswith('.txt'):
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        text_content += f.read() + "\n"
-                except Exception:
-                    pass
-    return text_content
 
-def extract_text_from_upload_cached(uploaded_files, state_key):
-    if not uploaded_files:
-        if state_key in st.session_state:
-            st.session_state[state_key] = ""
-        if f"{state_key}_files" in st.session_state:
-            st.session_state[f"{state_key}_files"] = []
-        return ""
-    
-    current_file_info = [(f.name, f.size) for f in uploaded_files]
-    
-    if state_key in st.session_state and f"{state_key}_files" in st.session_state:
-        if st.session_state[f"{state_key}_files"] == current_file_info:
-            return st.session_state[state_key]
-            
-    with st.spinner('문서를 분석하기 위해 텍스트를 추출 중입니다...'):
-        text_content = ""
-        for file in uploaded_files:
-            file.seek(0)
-            if file.name.lower().endswith('.pdf'):
-                try:
-                    reader = PyPDF2.PdfReader(file)
-                    for page in reader.pages:
-                        extracted = page.extract_text()
-                        if extracted:
-                            text_content += extracted + "\n"
-                except Exception:
-                    pass
-            elif file.name.lower().endswith('.txt'):
-                try:
-                    text_content += file.getvalue().decode('utf-8') + "\n"
-                except Exception:
-                    pass
-        
-        st.session_state[state_key] = text_content
-        st.session_state[f"{state_key}_files"] = current_file_info
-        
-    return text_content
 
 # ==========================================
 # 1. API 요청 및 데이터 필터 함수 (기존과 동일)
