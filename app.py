@@ -13,6 +13,10 @@ import PyPDF2
 from dotenv import load_dotenv # ★ 금고 여는 라이브러리 추가
 import math
 import matplotlib.font_manager as fm
+import tempfile
+import zipfile
+import json
+import traceback
 
 warnings.filterwarnings('ignore')
 
@@ -151,9 +155,36 @@ def extract_text_from_upload_cached(uploaded_files, state_key):
         
     return text_content
 
+# ==========================================
+# ★ 0-2. 업로드된 공간자료(SHP/GeoJSON) 파싱 함수
+# ==========================================
+@st.cache_data(show_spinner=False)
+def parse_uploaded_spatial_files(_uploaded_files):
+    if not _uploaded_files:
+        return None
+    try:
+        temp_dir = tempfile.mkdtemp()
+        target_read_file = None
+        for uf in _uploaded_files:
+            file_path = os.path.join(temp_dir, uf.name)
+            with open(file_path, "wb") as f:
+                f.write(uf.getbuffer())
+            if uf.name.lower().endswith('.shp') or uf.name.lower().endswith('.geojson') or uf.name.lower().endswith('.json'):
+                target_read_file = file_path
+                
+        if target_read_file:
+            gdf = gpd.read_file(target_read_file)
+            return gdf
+    except Exception:
+        pass
+    return None
+
 with st.sidebar:
-    st.markdown("### 📁 B단계 참고 문서 업로드")
-    st.info("웹 배포 환경에서는 이 곳에 직접 파일을 업로드해주세요. (다중 업로드 가능)")
+    st.markdown("### 🔗 참고 링크")
+    st.info("[도시·군기본계획 통합열람 (토지이음)](https://www.eum.go.kr/web/in/pd/pdBoardList.jsp?subType=C&searchType=&searchWord=)")
+    st.markdown("---")
+    
+    st.markdown("### 📁 B단계 참고 자료 업로드")
     
     # 텍스트 추출 한도 (예: 10만 자)
     TEXT_LIMIT = 100000
@@ -172,7 +203,20 @@ with st.sidebar:
     if uploaded_adj_files:
         adj_extracted = extract_text_from_upload_cached(uploaded_adj_files, "adj_text_cache")
         if len(adj_extracted) > TEXT_LIMIT:
-            st.warning('문서 용량이 너무 큽니다. 핵심 부분만 발췌해서 올려주세요')
+             st.warning('문서 용량이 너무 큽니다. 핵심 부분만 발췌해서 올려주세요')
+             
+    st.markdown("**3. 지역현안사항 (공간 데이터 업로드)**")
+    uploaded_spatial_files = st.file_uploader(
+        "공간 데이터 업로드 (.geojson, .json 지정 또는 .shp, .shx, .dbf 파일들을 함께 선택)", 
+        type=['geojson', 'json', 'shp', 'shx', 'dbf', 'prj'], 
+        accept_multiple_files=True, 
+        key="upload_spatial"
+    )
+    
+    # SHP 파일 등은 묶음으로 처리하기 위한 임시 저장 로직
+    spatial_data_status = st.empty()
+    if uploaded_spatial_files:
+        spatial_data_status.success(f"{len(uploaded_spatial_files)}개의 공간 파일이 업로드되었습니다. B단계 분석 시 행정동과 자동 교차 분석됩니다.")
             
     st.markdown("---")
 
@@ -564,6 +608,61 @@ with col_b:
                     policy_instruction = policy_text
             else:
                 policy_instruction = "반영안함"
+            
+            # --- 🚀 [신규 기능] 업로드된 공간 데이터 자동 텍스트 변환 병합 ---
+            spatial_insights = ""
+            if uploaded_spatial_files and st.session_state.get('analysis_done_A') and 'dong_gdf' in st.session_state:
+                with st.spinner("업로드된 공간 데이터(SHP/GeoJSON)와 행정동 경계를 교차 분석 중입니다..."):
+                    try:
+                        # 1. 임시 디렉토리에 파일 저장
+                        temp_dir = tempfile.mkdtemp()
+                        saved_files = []
+                        target_read_file = None
+                        
+                        for uf in uploaded_spatial_files:
+                            file_path = os.path.join(temp_dir, uf.name)
+                            with open(file_path, "wb") as f:
+                                f.write(uf.getbuffer())
+                            saved_files.append(file_path)
+                            
+                            # 읽어들일 주 파일 식별
+                            if uf.name.lower().endswith('.shp') or uf.name.lower().endswith('.geojson') or uf.name.lower().endswith('.json'):
+                                target_read_file = file_path
+                        
+                        if target_read_file:
+                            # 2. GeoDataFrame으로 열기
+                            uploaded_gdf = gpd.read_file(target_read_file)
+                            
+                            # 3. 좌표계 통일 (dong_gdf와 동일하게)
+                            dong_gdf = st.session_state['dong_gdf']
+                            if uploaded_gdf.crs is None:
+                                uploaded_gdf.set_crs(epsg=5179, inplace=True) # 기본 5179 가정
+                            else:
+                                uploaded_gdf = uploaded_gdf.to_crs(dong_gdf.crs)
+                            
+                            # 4. 공간 조인 (Spatial Join) 을 통해 어느 행정동에 걸치는지 파악
+                            join_gdf = gpd.sjoin(uploaded_gdf, dong_gdf[['adm_cd', 'adm_nm', 'geometry']], how='inner', predicate='intersects')
+                            
+                            if not join_gdf.empty:
+                                spatial_insights += "\n[추가 분석 데이터: 업로드된 공간 기반 현안/개발사업]\n"
+                                # 행정동별로 묶어서 요약
+                                grouped = join_gdf.groupby('adm_nm').size().reset_index(name='count')
+                                dongs_affected = ", ".join(grouped['adm_nm'].tolist())
+                                spatial_insights += f"- 사용자가 업로드한 공간 도면 데이터(SHP/GeoJSON)를 행정동 경계와 공간 연산(Spatial Intersection)한 결과입니다.\n"
+                                spatial_insights += f"- 해당 사업/노선/구역계는 다음 지역을 직접적으로 관통하거나 포함하고 있습니다: **{dongs_affected}**.\n"
+                                spatial_insights += f"- 따라서 이 지역들({dongs_affected})은 신규 인프라 확충 또는 개발 사업으로 인해 미래 물리적 공간구조(중심지 위상)가 크게 상향 변화할 잠재력이 지대합니다. 종합 분석 시 이들 행정동의 전략적 우선순위를 높게 평가하십시오.\n"
+                            else:
+                                spatial_insights += "\n[추가 분석 데이터: 공간 연산 결과]\n- 업로드된 공간 데이터가 현재 대상 시·군·구 행정동 경계와 겹치지 않습니다. 좌표계를 확인하거나 대상지 범위를 확인하십시오.\n"
+                        else:
+                            spatial_insights += "\n- 공간 데이터를 처리할 수 없습니다. .shp 파일이나 .geojson 메인 파일이 누락되었을 수 있습니다."
+                            
+                    except Exception as e:
+                        spatial_insights += f"\n- 공간 데이터 변환 중 오류 발생: {str(e)}"
+            
+            # 최종 정책 사항에 합치기
+            if spatial_insights:
+                if policy_instruction == "반영안함": policy_instruction = ""
+                policy_instruction += "\n" + spatial_insights
 
             qual_prompt = f"""
             작업 목표: [{selected_sido} {selected_sigungu_name}]의 정성적 현황 시사점을 분석하여 공공기관용 요약 보고서를 작성합니다.
@@ -724,6 +823,19 @@ if main_tab == "A. 정량 분석 결과":
                     legend_kwds={'loc': 'lower right', 'fontsize': 8, 'title': '지표구간', 'title_fontsize': 9, 'bbox_to_anchor': (1.15, 0)}
                 )
                 
+                # [신규 추가] 사용자가 업로드한 공간자료(SHP, GeoJSON)가 있으면 지도 위에 오버레이 그림
+                uploaded_spatial_gdf = parse_uploaded_spatial_files(uploaded_spatial_files)
+                if uploaded_spatial_gdf is not None:
+                    try:
+                        if uploaded_spatial_gdf.crs is None:
+                            uploaded_spatial_gdf.set_crs(epsg=5179, inplace=True)
+                        overlay_gdf = uploaded_spatial_gdf.to_crs(main_gdf.crs)
+                        
+                        # 화면을 넘기지 않기 위해 교차하는 부분만 추출하거나 클리핑할 수 있으나, 단순 중첩 표시
+                        overlay_gdf.plot(ax=ax, facecolor='none', edgecolor='red', linewidth=2.5, linestyle='--', alpha=0.7)
+                    except Exception:
+                        pass
+                
                 # 메인 영역 라벨링 (지시선 포함)
                 main_gdf['rep_pt'] = main_gdf.geometry.representative_point()
                 for i, (idx, row) in enumerate(main_gdf.iterrows()):
@@ -820,6 +932,14 @@ if main_tab == "A. 정량 분석 결과":
                     scheme='equal_interval', k=5, edgecolor='black', linewidth=0.5, 
                     legend_kwds={'loc': 'lower right', 'fontsize': 8, 'title': '지수구간', 'title_fontsize': 9, 'bbox_to_anchor': (1.15, 0)}
                 )
+                
+                # [신규 추가] 사용자가 업로드한 공간자료(SHP, GeoJSON) 지도 위에 오버레이
+                if uploaded_spatial_gdf is not None:
+                    try:
+                        overlay_gdf = uploaded_spatial_gdf.to_crs(main_gdf.crs)
+                        overlay_gdf.plot(ax=ax, facecolor='none', edgecolor='red', linewidth=2.5, linestyle='--', alpha=0.7)
+                    except Exception:
+                        pass
                 
                 # 메인 라벨링
                 main_gdf['rep_pt'] = main_gdf.geometry.representative_point()
