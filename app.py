@@ -22,42 +22,42 @@ load_dotenv()
 st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_icon="🏙️", layout="wide")
 
 import urllib.request
+import urllib.error
 
-font_name = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
-installed_fonts = [f.name for f in fm.fontManager.ttflist]
-
-if platform.system() == 'Windows' and 'Malgun Gothic' not in installed_fonts:
+# ===== 가장 확실한 폰트 로드 방식 (로컬 파일 최우선) =====
+custom_font_path = 'NanumGothic.ttf'
+# 1. 로컬에 폰트가 없으면 다운로드 시도
+if not os.path.exists(custom_font_path):
     try:
-        fm.fontManager.addfont('C:/Windows/Fonts/malgun.ttf')
-        font_name = 'Malgun Gothic'
+        urllib.request.urlretrieve("https://github.com/naver/nanumfont/raw/master/NanumFont_TTF_ALL/NanumGothic.ttf", custom_font_path)
     except Exception:
         pass
-elif font_name not in installed_fonts:
-    for fallback in ['Malgun Gothic', 'AppleGothic', 'NanumGothic', 'Gulim']:
-        if fallback in installed_fonts:
-            font_name = fallback
-            break
 
-plt.rcParams['font.family'] = font_name
-plt.rcParams['axes.unicode_minus'] = False
-
-# 고정 폰트 객체 생성 (Windows 환경 및 Linux 배포 환경에서 폰트 깨짐 완벽 방지용)
-if platform.system() == 'Windows':
-    custom_font_path = 'C:/Windows/Fonts/malgun.ttf'
-else:
-    custom_font_path = 'NanumGothic.ttf'
-    if not os.path.exists(custom_font_path):
-        try:
-            urllib.request.urlretrieve("https://github.com/naver/nanumfont/raw/master/NanumFont_TTF_ALL/NanumGothic.ttf", custom_font_path)
-            fm.fontManager.addfont(custom_font_path)
-        except Exception:
-            pass
-
+# 2. 폰트 적용
 if os.path.exists(custom_font_path):
-    custom_fontprops = fm.FontProperties(fname=custom_font_path)
+    try:
+        fm.fontManager.addfont(custom_font_path)
+        plt.rcParams['font.family'] = 'NanumGothic'
+        custom_fontprops = fm.FontProperties(fname=custom_font_path)
+    except Exception:
+        plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
+        custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
 else:
-    custom_fontprops = fm.FontProperties(family=font_name)
+    # 윈도우 기본 폰트 시도
+    windows_font = 'C:/Windows/Fonts/malgun.ttf'
+    if platform.system() == 'Windows' and os.path.exists(windows_font):
+        try:
+            fm.fontManager.addfont(windows_font)
+            plt.rcParams['font.family'] = 'Malgun Gothic'
+            custom_fontprops = fm.FontProperties(fname=windows_font)
+        except Exception:
+            plt.rcParams['font.family'] = 'Malgun Gothic'
+            custom_fontprops = fm.FontProperties(family='Malgun Gothic')
+    else:
+        plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
+        custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
 
+plt.rcParams['axes.unicode_minus'] = False
 # ==========================================================
 # [설정] 환경변수에서 API 키 안전하게 불러오기! (코드에 키 노출 X)
 # ==========================================================
@@ -717,7 +717,12 @@ if main_tab == "A. 정량 분석 결과":
                 # 메인 맵 그리기
                 main_gdf_bounds = main_gdf.copy()
                 main_gdf.plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                main_plot = main_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.3, 'pad': 0.02, 'aspect': 30})
+                # 분리형(이산형) 범례를 위해 scheme='equal_interval' 적용
+                main_plot = main_gdf.plot(
+                    column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax, legend=True, 
+                    scheme='equal_interval', k=5, edgecolor='black', linewidth=0.5, 
+                    legend_kwds={'loc': 'lower right', 'fontsize': 8, 'title': '지표구간', 'title_fontsize': 9, 'bbox_to_anchor': (1.15, 0)}
+                )
                 
                 # 메인 영역 라벨링 (지시선 포함)
                 main_gdf['rep_pt'] = main_gdf.geometry.representative_point()
@@ -760,7 +765,7 @@ if main_tab == "A. 정량 분석 결과":
                     # 삽도에 도서지역 그리기 (메인과 동일한 colormap)
                     vmin, vmax = map_gdf[req_item].min(), map_gdf[req_item].max()
                     island_gdf.plot(ax=ax_inset, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                    island_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax_inset, legend=False, edgecolor='black', linewidth=0.5, vmin=vmin, vmax=vmax)
+                    island_gdf.plot(column=req_item, cmap=MAP_COLORS[req_item][0], ax=ax_inset, legend=False, scheme='equal_interval', k=5, edgecolor='black', linewidth=0.5)
                     
                     # 삽도 라벨링
                     island_gdf['rep_pt'] = island_gdf.geometry.representative_point()
@@ -810,7 +815,11 @@ if main_tab == "A. 정량 분석 결과":
 
                 # 메인 맵 그리기
                 main_gdf.plot(ax=ax, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                main_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax, legend=True, edgecolor='black', linewidth=0.5, legend_kwds={'shrink': 0.3, 'pad': 0.02, 'aspect': 30})
+                main_gdf.plot(
+                    column="★중심지_지수(합산)", cmap="PuBu", ax=ax, legend=True, 
+                    scheme='equal_interval', k=5, edgecolor='black', linewidth=0.5, 
+                    legend_kwds={'loc': 'lower right', 'fontsize': 8, 'title': '지수구간', 'title_fontsize': 9, 'bbox_to_anchor': (1.15, 0)}
+                )
                 
                 # 메인 라벨링
                 main_gdf['rep_pt'] = main_gdf.geometry.representative_point()
@@ -850,7 +859,7 @@ if main_tab == "A. 정량 분석 결과":
                     
                     vmin, vmax = map_gdf["★중심지_지수(합산)"].min(), map_gdf["★중심지_지수(합산)"].max()
                     island_gdf.plot(ax=ax_inset, facecolor='lightgray', edgecolor='white', linewidth=0.8)
-                    island_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax_inset, legend=False, edgecolor='black', linewidth=0.5, vmin=vmin, vmax=vmax)
+                    island_gdf.plot(column="★중심지_지수(합산)", cmap="PuBu", ax=ax_inset, legend=False, scheme='equal_interval', k=5, edgecolor='black', linewidth=0.5)
                     
                     island_gdf['rep_pt'] = island_gdf.geometry.representative_point()
                     for i, (idx, row) in enumerate(island_gdf.iterrows()):
