@@ -453,6 +453,7 @@ def get_sgis_dong(target_codes, year, token):
 def get_sgis_stats(dong_gdf, year, token):
     pop_dict, biz_dict, worker_dict = {}, {}, {}
     parent_codes = dong_gdf['adm_cd'].astype(str).str[:5].unique()
+    
     for gu in parent_codes:
         # 인구 데이터
         pop_url = "https://sgisapi.kostat.go.kr/OpenAPI3/stats/searchpopulation.json"
@@ -463,22 +464,32 @@ def get_sgis_stats(dong_gdf, year, token):
                 acd = str(item.get("adm_cd", "")).strip()
                 pop_dict[acd] = safe_int(item.get("tot_ppltn", item.get("population", 0)))
         
-        # 사업체/종사자 데이터
+        # 사업체/종사자 데이터 (최신 연도 부재 시 이전 연도 자동 폴백)
         biz_url = "https://sgisapi.kostat.go.kr/OpenAPI3/stats/company.json"
-        biz_res = safe_req(biz_url, {"year": str(year), "adm_cd": str(gu), "low_search": "1", "accessToken": token})
-        err_cd_b = biz_res.get("errCd", -1)
-        if err_cd_b == 0 or str(err_cd_b) == "0":
-            for item in biz_res.get("result", []):
-                acd = str(item.get("adm_cd", "")).strip()
-                biz_dict[acd] = safe_int(item.get("corp_cnt", 0))
-                worker_dict[acd] = safe_int(item.get("tot_worker", item.get("employee", 0)))
+        biz_found = False
+        for try_year in [int(year), int(year)-1, int(year)-2]:
+            biz_res = safe_req(biz_url, {"year": str(try_year), "adm_cd": str(gu), "low_search": "1", "accessToken": token})
+            err_cd_b = biz_res.get("errCd", -1)
+            if err_cd_b == 0 or str(err_cd_b) == "0":
+                result_items = biz_res.get("result", [])
+                if result_items:
+                    # 'N/A' 값 체크 - 모든 값이 N/A면 다음 연도로
+                    sample_val = str(result_items[0].get("corp_cnt", "N/A"))
+                    if sample_val == "N/A":
+                        continue  # 이 연도는 데이터 미공개, 다음 연도 시도
+                    for item in result_items:
+                        acd = str(item.get("adm_cd", "")).strip()
+                        biz_dict[acd] = safe_int(item.get("corp_cnt", 0))
+                        worker_dict[acd] = safe_int(item.get("tot_worker", item.get("employee", 0)))
+                    biz_found = True
+                    break
     
     # 디버깅: 데이터 수집 실패 시 st.warning으로 표시
     import streamlit as _st_debug
     if not pop_dict:
         _st_debug.warning(f"⚠️ 인구 데이터 수집 실패 (parent_codes: {list(parent_codes)}, year: {year})")
     if not biz_dict:
-        _st_debug.warning(f"⚠️ 사업체 데이터 수집 실패 (parent_codes: {list(parent_codes)}, year: {year})")
+        _st_debug.warning(f"⚠️ 사업체 데이터 수집 실패 - {year}년 및 이전 2개년 데이터 부재")
     
     return pop_dict, biz_dict, worker_dict
 
@@ -502,6 +513,8 @@ def get_vworld_zoning_bbox(minx, miny, maxx, maxy, key, depth=0):
         df2 = get_vworld_zoning_bbox(midx, miny, maxx, midy, key, depth+1)
         df3 = get_vworld_zoning_bbox(minx, midy, midx, maxy, key, depth+1)
         df4 = get_vworld_zoning_bbox(midx, midy, maxx, maxy, key, depth+1)
+        parts = [df for df in [df1, df2, df3, df4] if not df.empty]
+        return pd.concat(parts, ignore_index=True) if parts else gpd.GeoDataFrame()
     return gdf
 
 @st.cache_data(show_spinner=False)
@@ -1119,6 +1132,8 @@ with chap1_tab:
                 st.session_state['diag_report'] = get_gemini_response(diag_prompt, [], GEMINI_API_KEY, model_override="gemini-2.5-flash")
             except Exception as e:
                 st.error(str(e))
+        # ★ 총괄 분석 플래그 리셋 (슬라이더 등 위젯 조작 시 재분석 방지)
+        st.session_state['run_all_chap1'] = False
     if 'diag_report' in st.session_state:
         st.success(st.session_state['diag_report'])
 
