@@ -29,11 +29,24 @@ import urllib.request
 import urllib.error
 
 # ===== 가장 확실한 폰트 로드 방식 (로컬 파일 최우선) =====
-# 폰트 탐색 순서: 작업 디렉토리 → @@폰트 폴더 → GitHub 다운로드 → Windows 기본폰트
+# 1) matplotlib 폰트 캐시 삭제 (오래된 캐시가 폰트 인식을 방해하는 문제 방지)
+try:
+    import matplotlib as _mpl
+    _cache_dir = _mpl.get_cachedir()
+    if _cache_dir and os.path.isdir(_cache_dir):
+        for _cf in os.listdir(_cache_dir):
+            if _cf.startswith('fontlist'):
+                os.remove(os.path.join(_cache_dir, _cf))
+except Exception:
+    pass
+
+# 2) 폰트 탐색 순서: 작업 디렉토리 → @@폰트 폴더 → GitHub 다운로드 → Windows 기본폰트
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _font_candidates = [
-    'NanumGothic.ttf',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '@@폰트', 'NanumGothic.ttf'),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '@@폰트', 'NanumGothicBold.ttf'),
+    os.path.join(_APP_DIR, 'NanumGothic.ttf'),
+    os.path.join(_APP_DIR, '@@폰트', 'NanumGothic.ttf'),
+    os.path.join(_APP_DIR, '@@폰트', 'NanumGothicBold.ttf'),
+    'C:/Windows/Fonts/malgun.ttf',
 ]
 
 custom_font_path = None
@@ -44,7 +57,7 @@ for _fp in _font_candidates:
 
 # 로컬에 폰트가 없으면 GitHub에서 다운로드 시도
 if custom_font_path is None:
-    _download_path = 'NanumGothic.ttf'
+    _download_path = os.path.join(_APP_DIR, 'NanumGothic.ttf')
     try:
         urllib.request.urlretrieve("https://github.com/naver/nanumfont/raw/master/NanumFont_TTF_ALL/NanumGothic.ttf", _download_path)
         if os.path.exists(_download_path):
@@ -52,7 +65,12 @@ if custom_font_path is None:
     except Exception:
         pass
 
-# 폰트 적용
+# 3) 폰트 적용 - fontManager 재구축 후 등록
+try:
+    fm._load_fontmanager(try_read_cache=False)  # 캐시 무시하고 폰트 매니저 재구축
+except Exception:
+    pass
+
 if custom_font_path and os.path.exists(custom_font_path):
     try:
         fm.fontManager.addfont(custom_font_path)
@@ -63,19 +81,8 @@ if custom_font_path and os.path.exists(custom_font_path):
         plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
         custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
 else:
-    # 최종 폴백: 윈도우 기본 폰트
-    windows_font = 'C:/Windows/Fonts/malgun.ttf'
-    if platform.system() == 'Windows' and os.path.exists(windows_font):
-        try:
-            fm.fontManager.addfont(windows_font)
-            plt.rcParams['font.family'] = 'Malgun Gothic'
-            custom_fontprops = fm.FontProperties(fname=windows_font)
-        except Exception:
-            plt.rcParams['font.family'] = 'Malgun Gothic'
-            custom_fontprops = fm.FontProperties(family='Malgun Gothic')
-    else:
-        plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
-        custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
+    plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
+    custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
 
 plt.rcParams['axes.unicode_minus'] = False
 # ==========================================================
@@ -644,13 +651,17 @@ with chap1_tab:
                 else:
                     progress_bar = st.progress(10, text="행정구역 데이터 로드 중...")
                     
-                    # 1. 시도 전체 Sigungu 목록 가져오기 (인접 시군 파악용)
+                    # 1. 대상 시군구 행정동 경계 먼저 수집
+                    target_codes = sigungu_dict[selected_sigungu_name]
+                    target_gdf = get_sgis_dong(target_codes, target_year, sgis_token)
+                    
+                    # 2. 같은 시도 내 시군구 코드 수집
                     all_sido_codes = []
                     for k, v in sigungu_dict.items():
                         if k != "전체":
                             all_sido_codes.extend(v)
                     
-                    # 2. ★ 인접 시도의 시군구 코드도 추가 수집
+                    # 3. ★ 인접 시도의 시군구 코드도 추가 수집
                     adj_sido_codes_list = ADJACENT_SIDO_MAP.get(sido_code, [])
                     adj_extra_codes = []
                     for adj_sido_cd in adj_sido_codes_list:
@@ -659,13 +670,10 @@ with chap1_tab:
                             if k != "전체":
                                 adj_extra_codes.extend(v)
                     
-                    # 대상 시도 + 인접 시도 모든 시군구 코드 합치기
+                    # 같은 시도 + 인접 시도 모든 시군구 코드
                     all_display_codes = all_sido_codes + adj_extra_codes
                             
                     sido_gdf = get_sgis_dong(all_display_codes, target_year, sgis_token)
-                    
-                    target_codes = sigungu_dict[selected_sigungu_name]
-                    target_gdf = get_sgis_dong(target_codes, target_year, sgis_token)
                     
                     if not target_gdf.empty and not sido_gdf.empty:
                         # 읍면동 경계를 시·군·구 단위로 병합 (지저분한 내부 행정동 선 제거)
@@ -676,8 +684,18 @@ with chap1_tab:
                             sido_sigungu_gdf = sido_gdf
                             
                         target_geom = target_gdf.geometry.unary_union
-                        sido_geom = sido_sigungu_gdf.geometry.unary_union
-                        adj_geom = sido_geom.difference(target_geom)
+                        
+                        # 4. ★ 행정경계가 맞닿아 있는(touches/intersects) 시군구만 필터링
+                        target_geom_buffered = target_geom.buffer(100)  # 100m 여유 (경계 미세 오차 보정)
+                        adj_mask = sido_sigungu_gdf.geometry.intersects(target_geom_buffered)
+                        adj_sigungu_gdf = sido_sigungu_gdf[adj_mask]
+                        
+                        # 대상지 자체를 제외한 인접 시군구 geometry
+                        adj_all_geom = adj_sigungu_gdf.geometry.unary_union
+                        adj_geom = adj_all_geom.difference(target_geom)
+                        
+                        # 지도 배경용 전체 범위 (인접 시군구만 포함)
+                        sido_sigungu_gdf = adj_sigungu_gdf
                         
                         start_year = 2015
                         end_year = min(int(target_year), 2024)
