@@ -696,6 +696,7 @@ with chap1_tab:
                         
                         # 지도 배경용 전체 범위 (인접 시군구만 포함)
                         sido_sigungu_gdf = adj_sigungu_gdf
+                        sido_geom = sido_sigungu_gdf.geometry.unary_union
                         
                         start_year = 2015
                         end_year = min(int(target_year), 2024)
@@ -889,19 +890,8 @@ with chap1_tab:
     st.markdown("#### (3) 인구, 산업, 토지이용 분포 현황 분석")
 
 
-    st.markdown("**중심지지수 산출 가중치 설정**")
-    w1, w2 = st.columns(2)
-    with w1:
-        w_pop = st.number_input("• 인구", value=1.0, step=0.1, min_value=0.0)
-        w_biz = st.number_input("• 사업체수", value=1.0, step=0.1, min_value=0.0)
-        w_worker = st.number_input("• 종사자수", value=1.0, step=0.1, min_value=0.0)
-    with w2:
-        w_zone1 = st.number_input("• 중심상업지역 비율", value=1.0, step=0.1, min_value=0.0)
-        w_zone2 = st.number_input("• 일반상업지역 비율", value=1.0, step=0.1, min_value=0.0)
-        w_zone3 = st.number_input("• 근린상업지역 비율", value=1.0, step=0.1, min_value=0.0)
-        w_zone4 = st.number_input("• 준주거지역 비율", value=1.0, step=0.1, min_value=0.0)
 
-    weights_map = {"인구(명)": w_pop, "사업체(수)": w_biz, "종사자(수)": w_worker, "중심상업(%)": w_zone1, "일반상업(%)": w_zone2, "근린상업(%)": w_zone3, "준주거(%)": w_zone4}
+    weights_map = {"인구(명)": 1.0, "사업체(수)": 1.0, "종사자(수)": 1.0, "중심상업(%)": 1.0, "일반상업(%)": 1.0, "근린상업(%)": 1.0, "준주거(%)": 1.0}
 
     if run_all:
         progress_text = "통계청 인증 및 분석 준비 중..."
