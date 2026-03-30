@@ -28,58 +28,28 @@ st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_i
 import urllib.request
 import urllib.error
 
-# ===== 가장 확실한 폰트 로드 방식 (로컬 파일 최우선) =====
-# 1) matplotlib 폰트 캐시 삭제 (오래된 캐시가 폰트 인식을 방해하는 문제 방지)
-try:
-    import matplotlib as _mpl
-    _cache_dir = _mpl.get_cachedir()
-    if _cache_dir and os.path.isdir(_cache_dir):
-        for _cf in os.listdir(_cache_dir):
-            if _cf.startswith('fontlist'):
-                os.remove(os.path.join(_cache_dir, _cf))
-except Exception:
-    pass
-
-# 2) 폰트 탐색 순서: 작업 디렉토리 → @@폰트 폴더 → GitHub 다운로드 → Windows 기본폰트
+# ===== 폰트 로드 (가장 확실한 방식: 파일 경로 직접 지정) =====
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_font_candidates = [
-    os.path.join(_APP_DIR, 'NanumGothic.ttf'),
-    os.path.join(_APP_DIR, '@@폰트', 'NanumGothic.ttf'),
-    os.path.join(_APP_DIR, '@@폰트', 'NanumGothicBold.ttf'),
-    'C:/Windows/Fonts/malgun.ttf',
-]
 
+# 1) @@폰트 폴더의 폰트를 작업 디렉토리로 복사 (한 번만 실행)
+_local_font = os.path.join(_APP_DIR, 'NanumGothic.ttf')
+_source_font = os.path.join(_APP_DIR, '@@폰트', 'NanumGothic.ttf')
+if not os.path.exists(_local_font) and os.path.exists(_source_font):
+    import shutil
+    shutil.copy2(_source_font, _local_font)
+
+# 2) 폰트 파일 경로 결정
 custom_font_path = None
-for _fp in _font_candidates:
+for _fp in [_local_font, _source_font, 'C:/Windows/Fonts/malgun.ttf']:
     if os.path.exists(_fp):
         custom_font_path = _fp
         break
 
-# 로컬에 폰트가 없으면 GitHub에서 다운로드 시도
-if custom_font_path is None:
-    _download_path = os.path.join(_APP_DIR, 'NanumGothic.ttf')
-    try:
-        urllib.request.urlretrieve("https://github.com/naver/nanumfont/raw/master/NanumFont_TTF_ALL/NanumGothic.ttf", _download_path)
-        if os.path.exists(_download_path):
-            custom_font_path = _download_path
-    except Exception:
-        pass
-
-# 3) 폰트 적용 - fontManager 재구축 후 등록
-try:
-    fm._load_fontmanager(try_read_cache=False)  # 캐시 무시하고 폰트 매니저 재구축
-except Exception:
-    pass
-
-if custom_font_path and os.path.exists(custom_font_path):
-    try:
-        fm.fontManager.addfont(custom_font_path)
-        _font_name = fm.FontProperties(fname=custom_font_path).get_name()
-        plt.rcParams['font.family'] = _font_name
-        custom_fontprops = fm.FontProperties(fname=custom_font_path)
-    except Exception:
-        plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
-        custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
+# 3) 폰트 적용 - fname 매개변수로 직접 지정 (쿠시 무시)
+if custom_font_path:
+    fm.fontManager.addfont(custom_font_path)
+    custom_fontprops = fm.FontProperties(fname=custom_font_path)
+    plt.rcParams['font.family'] = custom_fontprops.get_name()
 else:
     plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
     custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
@@ -927,26 +897,56 @@ with chap1_tab:
 
         my_bar.progress(50, text="[2/4] 국토부 용도지역 데이터 병합 중...")
         zoning_list = []
+        _zoning_fail_count = 0
         for idx, row in dong_3857.iterrows():
             b = row.geometry.bounds 
             zdf = get_vworld_zoning_bbox(b[0], b[1], b[2], b[3], VWORLD_KEY)
-            if not zdf.empty: zoning_list.append(zdf)
+            if not zdf.empty:
+                zoning_list.append(zdf)
+            else:
+                _zoning_fail_count += 1
+            time.sleep(0.3)  # VWorld API 속도 제한 방지
+        
+        if _zoning_fail_count > 0:
+            st.warning(f"⚠️ 용도지역 수집: {len(dong_3857)}개 행정동 중 {_zoning_fail_count}개 응답 없음 (VWorld API 제한 또는 데이터 부재)")
 
         zoning_gdf = pd.concat(zoning_list, ignore_index=True) if zoning_list else gpd.GeoDataFrame()
+        
+        # ★ 디버그: 수집 결과 표시
+        st.caption(f"📋 [디버그] 용도지역 수집 결과: {len(zoning_list)}개 동에서 총 {len(zoning_gdf)}개 피처")
+        
         target_mapping = {'UQA210': '중심상업', 'UQA220': '일반상업', 'UQA230': '근린상업', 'UQA130': '준주거'}
         if not zoning_gdf.empty:
-            code_col = 'ucode' if 'ucode' in zoning_gdf.columns else [c for c in zoning_gdf.columns if 'code' in c.lower() or 'cde' in c.lower()][0]
+            code_col = 'ucode' if 'ucode' in zoning_gdf.columns else None
+            if code_col is None:
+                for c in zoning_gdf.columns:
+                    if 'code' in c.lower() or 'cde' in c.lower():
+                        code_col = c
+                        break
+            if code_col is None:
+                st.error(f"⚠️ 용도지역 코드 컬럼을 찾을 수 없습니다. 컬럼: {list(zoning_gdf.columns)}")
+                code_col = zoning_gdf.columns[0]  # fallback
+            
+            unique_codes = zoning_gdf[code_col].unique()
+            st.caption(f"📋 [디버그] 코드컬럼={code_col}, 고유코드={list(unique_codes)[:15]}")
+            
+            before_filter = len(zoning_gdf)
             zoning_gdf = zoning_gdf[zoning_gdf[code_col].isin(target_mapping.keys())]
-            zoning_gdf['target_zone'] = zoning_gdf[code_col].map(target_mapping)
-            zoning_gdf['geom_wkt'] = zoning_gdf.geometry.to_wkt()
-            zoning_gdf = zoning_gdf.drop_duplicates(subset=['geom_wkt']).drop(columns=['geom_wkt'])
+            st.caption(f"📋 [디버그] 필터 후: {before_filter} → {len(zoning_gdf)}개 (대상코드: {list(target_mapping.keys())})")
+            
+            if not zoning_gdf.empty:
+                zoning_gdf['target_zone'] = zoning_gdf[code_col].map(target_mapping)
+                zoning_gdf['geom_wkt'] = zoning_gdf.geometry.to_wkt()
+                zoning_gdf = zoning_gdf.drop_duplicates(subset=['geom_wkt']).drop(columns=['geom_wkt'])
 
         my_bar.progress(80, text="[3/4] 공간 연산 중...")
-        zoning_gdf = zoning_gdf.to_crs(epsg=5179) if not zoning_gdf.empty else zoning_gdf
+        if not zoning_gdf.empty:
+            zoning_gdf = zoning_gdf.to_crs(epsg=5179)
         dong_gdf['geometry'] = dong_gdf.geometry.buffer(0)
         if not zoning_gdf.empty: zoning_gdf['geometry'] = zoning_gdf.geometry.buffer(0)
 
         intersected = gpd.overlay(dong_gdf, zoning_gdf, how='intersection') if not zoning_gdf.empty else gpd.GeoDataFrame()
+        st.caption(f"📋 [디버그] overlay 결과: {len(intersected)}개 피처")
         if not intersected.empty:
             intersected['area_sqm'] = intersected.geometry.area
             summary = intersected.groupby(['adm_cd', 'target_zone'])['area_sqm'].sum().reset_index()
@@ -1059,7 +1059,12 @@ with chap1_tab:
                 fig_q, ax_q = plt.subplots(figsize=(8, 8))
                 dong_map.plot(column='★중심지_지수(합산)', ax=ax_q, cmap='YlOrRd', 
                             edgecolor='black', linewidth=0.5, legend=True,
-                            legend_kwds={'label': '중심지 지수', 'shrink': 0.6})
+                            legend_kwds={'shrink': 0.6})
+                # 컬러바 라벨에 한글 폰트 직접 적용
+                cbar = ax_q.get_figure().axes[-1]  # 컬러바 축
+                cbar.set_ylabel('중심지 지수', fontproperties=custom_fontprops, fontsize=11)
+                for lbl in cbar.get_yticklabels():
+                    lbl.set_fontproperties(custom_fontprops)
                 
                 # 행정동 라벨 표시
                 for idx, row in dong_map.iterrows():
