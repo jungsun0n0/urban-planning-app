@@ -29,25 +29,41 @@ import urllib.request
 import urllib.error
 
 # ===== 가장 확실한 폰트 로드 방식 (로컬 파일 최우선) =====
-custom_font_path = 'NanumGothic.ttf'
-# 1. 로컬에 폰트가 없으면 다운로드 시도
-if not os.path.exists(custom_font_path):
+# 폰트 탐색 순서: 작업 디렉토리 → @@폰트 폴더 → GitHub 다운로드 → Windows 기본폰트
+_font_candidates = [
+    'NanumGothic.ttf',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '@@폰트', 'NanumGothic.ttf'),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '@@폰트', 'NanumGothicBold.ttf'),
+]
+
+custom_font_path = None
+for _fp in _font_candidates:
+    if os.path.exists(_fp):
+        custom_font_path = _fp
+        break
+
+# 로컬에 폰트가 없으면 GitHub에서 다운로드 시도
+if custom_font_path is None:
+    _download_path = 'NanumGothic.ttf'
     try:
-        urllib.request.urlretrieve("https://github.com/naver/nanumfont/raw/master/NanumFont_TTF_ALL/NanumGothic.ttf", custom_font_path)
+        urllib.request.urlretrieve("https://github.com/naver/nanumfont/raw/master/NanumFont_TTF_ALL/NanumGothic.ttf", _download_path)
+        if os.path.exists(_download_path):
+            custom_font_path = _download_path
     except Exception:
         pass
 
-# 2. 폰트 적용
-if os.path.exists(custom_font_path):
+# 폰트 적용
+if custom_font_path and os.path.exists(custom_font_path):
     try:
         fm.fontManager.addfont(custom_font_path)
-        plt.rcParams['font.family'] = 'NanumGothic'
+        _font_name = fm.FontProperties(fname=custom_font_path).get_name()
+        plt.rcParams['font.family'] = _font_name
         custom_fontprops = fm.FontProperties(fname=custom_font_path)
     except Exception:
         plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
         custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
 else:
-    # 윈도우 기본 폰트 시도
+    # 최종 폴백: 윈도우 기본 폰트
     windows_font = 'C:/Windows/Fonts/malgun.ttf'
     if platform.system() == 'Windows' and os.path.exists(windows_font):
         try:
@@ -244,6 +260,27 @@ SIDO_MAP = {
     "경기도": "31", "강원특별자치도": "32", "충청북도": "33", "충청남도": "34",
     "전북특별자치도": "35", "전라남도": "36", "경상북도": "37", "경상남도": "38",
     "제주특별자치도": "39"
+}
+
+# 인접 시도 매핑 (시가지 변화 지도에서 주변 시군구 표시용)
+ADJACENT_SIDO_MAP = {
+    "11": ["31", "23"],                          # 서울 ↔ 경기, 인천
+    "21": ["38", "26"],                          # 부산 ↔ 경남, 울산
+    "22": ["37", "38"],                          # 대구 ↔ 경북, 경남
+    "23": ["31", "11"],                          # 인천 ↔ 경기, 서울
+    "24": ["36"],                                 # 광주 ↔ 전남
+    "25": ["33", "34", "29"],                    # 대전 ↔ 충북, 충남, 세종
+    "26": ["38", "21", "37"],                    # 울산 ↔ 경남, 부산, 경북
+    "29": ["34", "33", "25"],                    # 세종 ↔ 충남, 충북, 대전
+    "31": ["11", "23", "32", "33", "34"],        # 경기 ↔ 서울, 인천, 강원, 충북, 충남
+    "32": ["31", "33", "37"],                    # 강원 ↔ 경기, 충북, 경북
+    "33": ["31", "32", "25", "29", "34", "37", "35"],  # 충북
+    "34": ["31", "29", "25", "33", "35", "36"],  # 충남
+    "35": ["33", "34", "36", "38"],              # 전북
+    "36": ["24", "34", "35", "38"],              # 전남
+    "37": ["32", "33", "22", "38", "26"],        # 경북
+    "38": ["21", "26", "22", "37", "35", "36"],  # 경남
+    "39": [],                                     # 제주 (인접 없음)
 }
 
 MAP_COLORS = {
@@ -612,8 +649,20 @@ with chap1_tab:
                     for k, v in sigungu_dict.items():
                         if k != "전체":
                             all_sido_codes.extend(v)
+                    
+                    # 2. ★ 인접 시도의 시군구 코드도 추가 수집
+                    adj_sido_codes_list = ADJACENT_SIDO_MAP.get(sido_code, [])
+                    adj_extra_codes = []
+                    for adj_sido_cd in adj_sido_codes_list:
+                        adj_sigungu = get_cached_sigungu_list(adj_sido_cd)
+                        for k, v in adj_sigungu.items():
+                            if k != "전체":
+                                adj_extra_codes.extend(v)
+                    
+                    # 대상 시도 + 인접 시도 모든 시군구 코드 합치기
+                    all_display_codes = all_sido_codes + adj_extra_codes
                             
-                    sido_gdf = get_sgis_dong(all_sido_codes, target_year, sgis_token)
+                    sido_gdf = get_sgis_dong(all_display_codes, target_year, sgis_token)
                     
                     target_codes = sigungu_dict[selected_sigungu_name]
                     target_gdf = get_sgis_dong(target_codes, target_year, sgis_token)
