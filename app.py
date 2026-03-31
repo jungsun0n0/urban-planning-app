@@ -125,6 +125,8 @@ VWORLD_KEY = _get_secret("VWORLD_KEY")
 SGIS_KEY = _get_secret("SGIS_KEY")
 SGIS_SECRET = _get_secret("SGIS_SECRET")
 GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
+# VWorld 도메인 (Cloud 배포 시 Streamlit URL, 로컬은 http://localhost)
+VWORLD_DOMAIN = _get_secret("VWORLD_DOMAIN") or "https://urban-planning-app-4omfysjhdmd64c3xh7pht9.streamlit.app"
 # ==========================================================
 
 # ==========================================
@@ -419,7 +421,7 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
 # 1. API 요청 및 데이터 필터 함수 (기존과 동일)
 # ==========================================
 def safe_req(url, params=None, retries=3):
-    headers = {'Referer': 'http://localhost'}
+    headers = {'Referer': VWORLD_DOMAIN}
     for attempt in range(retries):
         try:
             res = requests.get(url, params=params, headers=headers, timeout=15)
@@ -539,7 +541,7 @@ def get_vworld_zoning_bbox(minx, miny, maxx, maxy, key, depth=0):
     url = "https://api.vworld.kr/req/wfs"
     bbox_str = f"{minx},{miny},{maxx},{maxy},EPSG:3857"
     params = {
-        "key": key, "domain": "http://localhost", "SERVICE": "WFS",
+        "key": key, "domain": VWORLD_DOMAIN, "SERVICE": "WFS",
         "VERSION": "1.1.0", "REQUEST": "GetFeature", "TYPENAME": "lt_c_uq111",
         "OUTPUT": "application/json", "SRSNAME": "EPSG:3857",
         "MAXFEATURES": "1000", "BBOX": bbox_str
@@ -601,7 +603,7 @@ def get_vworld_road_bbox(minx, miny, maxx, maxy, key, depth=0):
     for code in target_codes:
         params = {
             "service": "data", "request": "GetFeature", "data": "lt_l_n3a0020000",
-            "key": key, "domain": "http://localhost", "crs": "EPSG:3857",
+            "key": key, "domain": VWORLD_DOMAIN, "crs": "EPSG:3857",
             "geomFilter": bbox_str, "size": 1000, "attrFilter": f"rddv:=:{code}"
         }
         res = safe_req(url, params)
