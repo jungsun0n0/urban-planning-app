@@ -422,31 +422,14 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
 # ==========================================
 def safe_req(url, params=None, retries=3):
     headers = {'Referer': VWORLD_DOMAIN}
-    _last_error = None
     for attempt in range(retries):
         try:
             res = requests.get(url, params=params, headers=headers, timeout=15)
             if res.status_code == 200:
-                data = res.json()
-                return data
-            # 비200 응답 로깅
-            _last_error = f"HTTP {res.status_code}"
-            if attempt == retries - 1:
-                try:
-                    err_body = res.text[:300]
-                except:
-                    err_body = "(unable to read)"
-                # VWorld API 실패 시 화면에 상세 표시
-                if 'vworld' in url:
-                    import streamlit as _st
-                    _st.warning(f"🔍 VWorld API 응답 실패: HTTP {res.status_code} | domain={params.get('domain','')} | body={err_body}")
+                return res.json()
         except Exception as e:
-            _last_error = str(e)
-            if attempt == retries - 1:
-                if 'vworld' in url:
-                    import streamlit as _st
-                    _st.warning(f"🔍 VWorld API 연결 실패: {str(e)[:200]}")
-            time.sleep(1)
+            if attempt < retries - 1:
+                time.sleep(1)
     return {}
 
 def safe_int(val):
@@ -827,7 +810,7 @@ with chap1_tab:
 - (세부내용3)
 
 ===SECTION_2===
-**2. 도시생장형태 분석 (확산/축소/정체)**
+**2. 도시성장형태 분석 (확산/축소/정체)**
 - (세부내용1)
 - (세부내용2)
 - (세부내용3)
@@ -1004,53 +987,90 @@ with chap1_tab:
 
         my_bar.progress(50, text="[2/4] 국토부 용도지역 데이터 병합 중...")
         
-        # ★ 디버그: VWORLD_KEY 상태 확인
-        if not VWORLD_KEY:
-            st.error("❌ VWORLD_KEY가 설정되지 않았습니다. 환경변수 또는 Streamlit Secrets에 VWORLD_KEY를 설정해 주세요.")
+        # ★ VWorld API 사전 연결 테스트 (해외 서버 차단 감지)
+        _vworld_available = False
+        if VWORLD_KEY:
+            try:
+                _test_res = requests.get("https://api.vworld.kr/req/wfs",
+                    params={"key": VWORLD_KEY, "domain": VWORLD_DOMAIN, "SERVICE": "WFS",
+                            "VERSION": "1.1.0", "REQUEST": "GetFeature", "TYPENAME": "lt_c_uq111",
+                            "OUTPUT": "application/json", "SRSNAME": "EPSG:3857",
+                            "MAXFEATURES": "1", "BBOX": f"{dong_3857.total_bounds[0]},{dong_3857.total_bounds[1]},{dong_3857.total_bounds[2]},{dong_3857.total_bounds[3]},EPSG:3857"},
+                    headers={'Referer': VWORLD_DOMAIN}, timeout=10)
+                if _test_res.status_code == 200 and 'features' in _test_res.json():
+                    _vworld_available = True
+                    st.caption("✅ VWorld API 연결 확인 완료")
+                else:
+                    st.caption(f"⚠️ VWorld API 응답 이상: HTTP {_test_res.status_code}")
+            except Exception as _te:
+                st.caption(f"⚠️ VWorld API 연결 불가: {str(_te)[:100]}")
+        else:
+            st.error("❌ VWORLD_KEY가 설정되지 않았습니다.")
         
-        zoning_list = []
-        _zoning_fail_count = 0
-        _first_vworld_diag = True  # 첫 요청 진단용
-        for idx, row in dong_3857.iterrows():
-            b = row.geometry.bounds
+        # ★ 캐시 파일 경로 (로컬에서 성공한 결과를 저장/재사용)
+        _cache_key = "_".join(sorted(target_codes)) + f"_{target_year}"
+        _cache_path = os.path.join(_APP_DIR, f"_zoning_cache_{_cache_key}.json")
+        
+        zoning_gdf = gpd.GeoDataFrame()
+        
+        if _vworld_available:
+            # ★ VWorld API 정상 → 실시간 수집
+            zoning_list = []
+            _zoning_fail_count = 0
+            for idx, row in dong_3857.iterrows():
+                b = row.geometry.bounds
+                zdf = get_vworld_zoning_bbox(b[0], b[1], b[2], b[3], VWORLD_KEY)
+                if not zdf.empty:
+                    zoning_list.append(zdf)
+                else:
+                    _zoning_fail_count += 1
+                time.sleep(0.3)
             
-            # ★ 진단: 첫 번째 행정동의 VWorld 원본 응답 직접 확인
-            if _first_vworld_diag:
-                _first_vworld_diag = False
-                _diag_url = "https://api.vworld.kr/req/wfs"
-                _diag_bbox = f"{b[0]},{b[1]},{b[2]},{b[3]},EPSG:3857"
-                _diag_params = {
-                    "key": VWORLD_KEY, "domain": VWORLD_DOMAIN, "SERVICE": "WFS",
-                    "VERSION": "1.1.0", "REQUEST": "GetFeature", "TYPENAME": "lt_c_uq111",
-                    "OUTPUT": "application/json", "SRSNAME": "EPSG:3857",
-                    "MAXFEATURES": "5", "BBOX": _diag_bbox
-                }
+            if _zoning_fail_count > 0:
+                st.warning(f"⚠️ 용도지역 수집: {len(dong_3857)}개 행정동 중 {_zoning_fail_count}개 응답 없음")
+            
+            zoning_gdf = pd.concat(zoning_list, ignore_index=True) if zoning_list else gpd.GeoDataFrame()
+            
+            # 성공한 결과를 캐시 파일로 저장 (다음 Cloud 배포 시 사용)
+            if not zoning_gdf.empty:
                 try:
-                    _diag_res = requests.get(_diag_url, params=_diag_params, 
-                                            headers={'Referer': VWORLD_DOMAIN}, timeout=15)
-                    _diag_status = _diag_res.status_code
-                    _diag_body = _diag_res.text[:500]
-                    _diag_feat_count = len(_diag_res.json().get('features', [])) if _diag_status == 200 else 0
-                    st.caption(f"🔍 [VWorld 진단] status={_diag_status} | domain={VWORLD_DOMAIN} | bbox={_diag_bbox[:60]}... | features={_diag_feat_count}")
-                    if _diag_feat_count == 0:
-                        st.warning(f"🔍 [VWorld 응답 본문] {_diag_body}")
-                except Exception as _de:
-                    st.error(f"🔍 [VWorld 진단 실패] {str(_de)[:200]}")
+                    zoning_gdf.to_file(_cache_path, driver="GeoJSON")
+                    st.caption(f"💾 용도지역 캐시 저장 완료: {_cache_path}")
+                except Exception:
+                    pass
+        else:
+            # ★ VWorld 차단 → 캐시 파일 로드 시도
+            _cache_loaded = False
+            if os.path.exists(_cache_path):
+                try:
+                    zoning_gdf = gpd.read_file(_cache_path)
+                    st.info(f"📂 VWorld API 접속 불가 → 캐시 데이터 로드 완료 ({len(zoning_gdf)}개 피처)")
+                    _cache_loaded = True
+                except Exception:
+                    pass
             
-            zdf = get_vworld_zoning_bbox(b[0], b[1], b[2], b[3], VWORLD_KEY)
-            if not zdf.empty:
-                zoning_list.append(zdf)
-            else:
-                _zoning_fail_count += 1
-            time.sleep(0.3)  # VWorld API 속도 제한 방지
-        
-        if _zoning_fail_count > 0:
-            st.warning(f"⚠️ 용도지역 수집: {len(dong_3857)}개 행정동 중 {_zoning_fail_count}개 응답 없음 (VWorld API 제한 또는 데이터 부재)")
-
-        zoning_gdf = pd.concat(zoning_list, ignore_index=True) if zoning_list else gpd.GeoDataFrame()
+            # 정확한 캐시가 없으면 하위 구별 캐시 합치기 시도
+            if not _cache_loaded:
+                _sub_gdfs = []
+                for _code in sorted(target_codes):
+                    _sub_path = os.path.join(_APP_DIR, f"_zoning_cache_{_code}_{target_year}.json")
+                    if os.path.exists(_sub_path):
+                        try:
+                            _sub_gdfs.append(gpd.read_file(_sub_path))
+                        except Exception:
+                            pass
+                if _sub_gdfs:
+                    zoning_gdf = pd.concat(_sub_gdfs, ignore_index=True)
+                    st.info(f"📂 VWorld API 접속 불가 → 하위 캐시 {len(_sub_gdfs)}개 합산 로드 ({len(zoning_gdf)}개 피처)")
+                    _cache_loaded = True
+            
+            if not _cache_loaded:
+                st.warning("⚠️ VWorld API가 이 서버에서 차단되어 용도지역 데이터를 수집할 수 없습니다.\n\n"
+                          "**해결 방법:** 로컬 PC에서 분석을 한 번 실행하면 캐시 파일이 자동 생성됩니다. "
+                          "이 파일을 GitHub에 커밋하면 Cloud에서도 캐시 데이터를 사용합니다.")
         
         # ★ 디버그: 수집 결과 표시
-        st.caption(f"📋 [디버그] 용도지역 수집 결과: {len(zoning_list)}개 동에서 총 {len(zoning_gdf)}개 피처")
+        st.caption(f"📋 [디버그] 용도지역 수집 결과: 총 {len(zoning_gdf)}개 피처")
         
         # ★ VWorld ucode PREFIX 매핑 (API는 세분류 6자리 코드로 응답)
         # UQA21x → 중심상업, UQA22x → 일반상업, UQA23x → 근린상업, UQA13x → 준주거
