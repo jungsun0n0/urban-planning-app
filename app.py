@@ -422,20 +422,30 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
 # ==========================================
 def safe_req(url, params=None, retries=3):
     headers = {'Referer': VWORLD_DOMAIN}
+    _last_error = None
     for attempt in range(retries):
         try:
             res = requests.get(url, params=params, headers=headers, timeout=15)
             if res.status_code == 200:
-                return res.json()
-            # 비200 응답 로깅 (API 키/도메인 문제 진단용)
+                data = res.json()
+                return data
+            # 비200 응답 로깅
+            _last_error = f"HTTP {res.status_code}"
             if attempt == retries - 1:
                 try:
-                    err_body = res.text[:200]
+                    err_body = res.text[:300]
                 except:
                     err_body = "(unable to read)"
+                # VWorld API 실패 시 화면에 상세 표시
+                if 'vworld' in url:
+                    import streamlit as _st
+                    _st.warning(f"🔍 VWorld API 응답 실패: HTTP {res.status_code} | domain={params.get('domain','')} | body={err_body}")
         except Exception as e:
+            _last_error = str(e)
             if attempt == retries - 1:
-                pass
+                if 'vworld' in url:
+                    import streamlit as _st
+                    _st.warning(f"🔍 VWorld API 연결 실패: {str(e)[:200]}")
             time.sleep(1)
     return {}
 
@@ -1000,8 +1010,33 @@ with chap1_tab:
         
         zoning_list = []
         _zoning_fail_count = 0
+        _first_vworld_diag = True  # 첫 요청 진단용
         for idx, row in dong_3857.iterrows():
-            b = row.geometry.bounds 
+            b = row.geometry.bounds
+            
+            # ★ 진단: 첫 번째 행정동의 VWorld 원본 응답 직접 확인
+            if _first_vworld_diag:
+                _first_vworld_diag = False
+                _diag_url = "https://api.vworld.kr/req/wfs"
+                _diag_bbox = f"{b[0]},{b[1]},{b[2]},{b[3]},EPSG:3857"
+                _diag_params = {
+                    "key": VWORLD_KEY, "domain": VWORLD_DOMAIN, "SERVICE": "WFS",
+                    "VERSION": "1.1.0", "REQUEST": "GetFeature", "TYPENAME": "lt_c_uq111",
+                    "OUTPUT": "application/json", "SRSNAME": "EPSG:3857",
+                    "MAXFEATURES": "5", "BBOX": _diag_bbox
+                }
+                try:
+                    _diag_res = requests.get(_diag_url, params=_diag_params, 
+                                            headers={'Referer': VWORLD_DOMAIN}, timeout=15)
+                    _diag_status = _diag_res.status_code
+                    _diag_body = _diag_res.text[:500]
+                    _diag_feat_count = len(_diag_res.json().get('features', [])) if _diag_status == 200 else 0
+                    st.caption(f"🔍 [VWorld 진단] status={_diag_status} | domain={VWORLD_DOMAIN} | bbox={_diag_bbox[:60]}... | features={_diag_feat_count}")
+                    if _diag_feat_count == 0:
+                        st.warning(f"🔍 [VWorld 응답 본문] {_diag_body}")
+                except Exception as _de:
+                    st.error(f"🔍 [VWorld 진단 실패] {str(_de)[:200]}")
+            
             zdf = get_vworld_zoning_bbox(b[0], b[1], b[2], b[3], VWORLD_KEY)
             if not zdf.empty:
                 zoning_list.append(zdf)
