@@ -28,40 +28,80 @@ st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_i
 import urllib.request
 import urllib.error
 
-# ===== 폰트 로드 (가장 확실한 방식: 파일 경로 직접 지정) =====
+# ===== 폰트 로드 (로컬 TTF 파일 직접 지정 방식 - 플랫폼 무관) =====
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 1) @@폰트 폴더의 폰트를 작업 디렉토리로 복사 (한 번만 실행)
+# 1) 폰트 파일 경로 결정 (작업 디렉토리 → @@폰트 폴더)
 _local_font = os.path.join(_APP_DIR, 'NanumGothic.ttf')
 _source_font = os.path.join(_APP_DIR, '@@폰트', 'NanumGothic.ttf')
+
+# @@폰트 폴더의 폰트를 작업 디렉토리로 복사
 if not os.path.exists(_local_font) and os.path.exists(_source_font):
     import shutil
     shutil.copy2(_source_font, _local_font)
 
-# 2) 폰트 파일 경로 결정
 custom_font_path = None
-for _fp in [_local_font, _source_font, 'C:/Windows/Fonts/malgun.ttf']:
+for _fp in [_local_font, _source_font, 'C:/Windows/Fonts/malgun.ttf', '/usr/share/fonts/truetype/nanum/NanumGothic.ttf']:
     if os.path.exists(_fp):
         custom_font_path = _fp
         break
 
-# 3) 폰트 적용 - fname 매개변수로 직접 지정 (쿠시 무시)
+# 2) matplotlib 폰트 캐시 삭제 후 재등록
+try:
+    import matplotlib as _mpl
+    _cache_dir = _mpl.get_cachedir()
+    if _cache_dir and os.path.isdir(_cache_dir):
+        for _cf in os.listdir(_cache_dir):
+            if _cf.startswith('fontlist'):
+                try:
+                    os.remove(os.path.join(_cache_dir, _cf))
+                except Exception:
+                    pass
+except Exception:
+    pass
+
+# 3) 폰트 등록 및 FontProperties 생성 (rcParams 의존 최소화)
 if custom_font_path:
-    fm.fontManager.addfont(custom_font_path)
+    try:
+        fm.fontManager.addfont(custom_font_path)
+    except Exception:
+        pass
     custom_fontprops = fm.FontProperties(fname=custom_font_path)
-    plt.rcParams['font.family'] = custom_fontprops.get_name()
+    # rcParams도 설정 (텍스트 위젯 등 fallback 용도)
+    try:
+        _family = custom_fontprops.get_name()
+        if _family:
+            plt.rcParams['font.family'] = _family
+    except Exception:
+        plt.rcParams['font.family'] = 'NanumGothic'
 else:
-    plt.rcParams['font.family'] = 'Malgun Gothic' if platform.system() == 'Windows' else 'AppleGothic'
+    if platform.system() == 'Windows':
+        plt.rcParams['font.family'] = 'Malgun Gothic'
+    elif platform.system() == 'Darwin':
+        plt.rcParams['font.family'] = 'AppleGothic'
+    else:
+        plt.rcParams['font.family'] = 'DejaVu Sans'
     custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
 
 plt.rcParams['axes.unicode_minus'] = False
 # ==========================================================
 # [설정] 환경변수에서 API 키 안전하게 불러오기! (코드에 키 노출 X)
+# Streamlit Cloud 대응: os.getenv → st.secrets 폴백
 # ==========================================================
-VWORLD_KEY = os.getenv("VWORLD_KEY")
-SGIS_KEY = os.getenv("SGIS_KEY")
-SGIS_SECRET = os.getenv("SGIS_SECRET")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+def _get_secret(key_name):
+    """os.getenv → st.secrets 폴백으로 API 키 로드"""
+    val = os.getenv(key_name)
+    if val:
+        return val
+    try:
+        return st.secrets[key_name]
+    except Exception:
+        return None
+
+VWORLD_KEY = _get_secret("VWORLD_KEY")
+SGIS_KEY = _get_secret("SGIS_KEY")
+SGIS_SECRET = _get_secret("SGIS_SECRET")
+GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
 # ==========================================================
 
 # ==========================================
@@ -361,7 +401,15 @@ def safe_req(url, params=None, retries=3):
             res = requests.get(url, params=params, timeout=15)
             if res.status_code == 200:
                 return res.json()
-        except Exception:
+            # 비200 응답 로깅 (API 키/도메인 문제 진단용)
+            if attempt == retries - 1:
+                try:
+                    err_body = res.text[:200]
+                except:
+                    err_body = "(unable to read)"
+        except Exception as e:
+            if attempt == retries - 1:
+                pass
             time.sleep(1)
     return {}
 
@@ -733,24 +781,35 @@ with chap1_tab:
 위의 연속적인 시계열 양적 변화 추이를 바탕으로, 이 지역의 중심지 구조 변화와 도시성장형태(확산/축소/정체)를 종합적으로 분석해 줘.
 반드시 다음 형태와 규칙을 엄격히 지켜서 작성해:
 
-[출력 형식 예시]
-**1. 첫번째 카테고리 소제목**
-- 첫번째 세부내용 (강화, 확대, 필요 등 단어로 종결, 상세하고 풍부하게 작성...)
-- 두번째 세부내용 (상세하고 풍부하게 작성...)
-- 세번째 세부내용 (상세하고 풍부하게 작성...)
+[출력 구조]
+구분자 ===SECTION_1===, ===SECTION_2===, ===SECTION_3=== 를 각 소제목 블록 바로 앞에 단독 줄로 기입할 것 (다른 문자 없이).
 
-**2. 두번째 카테고리 소제목**
-- 첫번째 세부내용
-...
+===SECTION_1===
+**1. 중심지 구조 변화 및 공간적 확산 추이**
+- (세부내용1)
+- (세부내용2)
+- (세부내용3)
+
+===SECTION_2===
+**2. 도시생장형태 분석 (확산/축소/정체)**
+- (세부내용1)
+- (세부내용2)
+- (세부내용3)
+
+===SECTION_3===
+**3. 인접 시·군과의 연담화 가능성 및 정책방향**
+- (세부내용1)
+- (세부내용2)
+- (세부내용3)
 
 [상세 지시사항]
-1. 위 출력 형식처럼 전체를 3가지 주요 카테고리로 나누고, 각 카테고리 제목(소제목)은 헤딩(###, #### 등) 태그를 쓰면 아래 줄과의 간격이 너무 벌어지므로 절대로 헤딩을 쓰지 말고 숫자와 볼드체(**)만 사용하여 '**1. 소제목**' 형태로 표시할 것.
-2. 하위 세부 내용은 반드시 '-' 기호를 사용한 글머리 기호(bullet point)로 3개씩 작성할 것.
-3. [분량 지정] 각 세부 내용(꼭지)은 한 줄로 짧게 끝나지 않도록, A4 용지로 출력했을 때 2줄 이상(약 80~120자 내외)이 될 만큼 구체적인 근거나 방향성을 담아 길고 상세하게 서술할 것.
-4. [어투 지정] 세부 내용의 끝맺음은 '~합니다', '~임', '~함' 등의 서술어 종결이 아니라, 반드시 '~확충', '~마련', '~필요', '~강화', '~도입'과 같이 핵심적인 '단어(명사)' 자체로 딱 떨어지게 마칠 것.
-5. 카테고리 소제목과 그 바로 첫번째 세부내용 사이에는 절대로 빈 줄(Enter)을 넣지 말 것. 반면, 서로 다른 카테고리 묶음 사이에는 빈 줄을 하나 넣어 확실히 구분할 것.
-6. 인사말, 맺음말, '핵심 시사점', '도출해 드리겠습니다' 등 불필요한 서두/맺음 구문은 일절 출력하지 말고 곧바로 '**1. 카테고리 소제목**'부터 시작할 것.
-7. [분석 중점] 중심지 구조의 공간적 분포 변화, 도시성장형태(확산형/정체형/축소형) 판단 근거, 인접 시·군과의 연담화 가능성을 핵심적으로 다룰 것.
+1. 소제목은 반드시 '**번호. 소제목**' 형태(볼드+번호). 헤딩(###, ####) 절대 금지.
+2. 하위 세부 내용은 '-' 글머리 기호 3개씩 작성.
+3. [분량] 각 세부 내용(꼭지)은 A4 2줄 이상(약 80~120자), 구체적 수치와 근거를 포함.
+4. [어투-핵심] 각 꼭지('-' 세부내용)는 반드시 하나의 문장으로만 구성. '~니다.', '~임.', '~함.' 등 중간 마침표로 문장을 끊지 말고, 한 문장이 끝까지 이어지도록 작성. 끝맺음은 '~확충', '~마련', '~필요', '~강화', '~도입' 등 핵심 명사 단어로 종결.
+5. 소제목과 첫 세부내용 사이 빈 줄 금지. 카테고리 간에만 빈 줄 1개.
+6. 인사말/맺음말/서두 일절 금지. 곧바로 ===SECTION_1=== 구분자부터 시작.
+7. [분석 중점] 중심지 구조의 공간적 분포 변화, 도시성장형태(확산형/정체형/축소형) 판단 근거, 인접 시·군과의 연담화 가능성 핵심 기술.
 """
                         
                         try:
@@ -862,7 +921,19 @@ with chap1_tab:
         plt.tight_layout(rect=[0, 0.12, 1, 0.95])
         
         with urban_col1:
-            st.success(st.session_state['urban_ai_insight'])
+            # 보고서 형식으로 AI 분석 결과 표시
+            import re as _re
+            _insight_raw = st.session_state.get('urban_ai_insight', '')
+            _sections = _re.split(r'===SECTION_\d+===', _insight_raw)
+            if len(_sections) >= 4:
+                # 구조화된 3섹션 보고서 표시
+                for _sec in _sections[1:4]:
+                    _sec = _sec.strip()
+                    if _sec:
+                        st.markdown(_sec)
+            else:
+                # 구분자 없을 경우 전체 표시
+                st.markdown(_insight_raw)
         with urban_col2:
             st.pyplot(fig)
             if road_source_msg:
@@ -896,6 +967,11 @@ with chap1_tab:
         dong_3857 = dong_gdf.to_crs(epsg=3857)
 
         my_bar.progress(50, text="[2/4] 국토부 용도지역 데이터 병합 중...")
+        
+        # ★ 디버그: VWORLD_KEY 상태 확인
+        if not VWORLD_KEY:
+            st.error("❌ VWORLD_KEY가 설정되지 않았습니다. 환경변수 또는 Streamlit Secrets에 VWORLD_KEY를 설정해 주세요.")
+        
         zoning_list = []
         _zoning_fail_count = 0
         for idx, row in dong_3857.iterrows():
@@ -915,29 +991,57 @@ with chap1_tab:
         # ★ 디버그: 수집 결과 표시
         st.caption(f"📋 [디버그] 용도지역 수집 결과: {len(zoning_list)}개 동에서 총 {len(zoning_gdf)}개 피처")
         
-        target_mapping = {'UQA210': '중심상업', 'UQA220': '일반상업', 'UQA230': '근린상업', 'UQA130': '준주거'}
+        # ★ VWorld ucode PREFIX 매핑 (API는 세분류 6자리 코드로 응답)
+        # UQA21x → 중심상업, UQA22x → 일반상업, UQA23x → 근린상업, UQA13x → 준주거
+        UCODE_PREFIX_MAP = [
+            ('UQA21', '중심상업'),
+            ('UQA22', '일반상업'),
+            ('UQA23', '근린상업'),
+            ('UQA13', '준주거'),
+        ]
+        ZONE_NAMES = [v for _, v in UCODE_PREFIX_MAP]
+
+        def map_ucode_to_zone(code_val):
+            code_str = str(code_val).upper()
+            for prefix, zone in UCODE_PREFIX_MAP:
+                if code_str.startswith(prefix):
+                    return zone
+            return None
+
         if not zoning_gdf.empty:
-            code_col = 'ucode' if 'ucode' in zoning_gdf.columns else None
+            # 코드 컬럼 탐지 (geometry 컬럼명은 건드리지 않도록 rename 사용)
+            col_rename = {c: c.lower() for c in zoning_gdf.columns if c.lower() != 'geometry'}
+            zoning_gdf = zoning_gdf.rename(columns=col_rename)
+
+            code_col = None
+            for _candidate in ['ucode', 'uq111cd', 'uqcd', 'code']:
+                if _candidate in zoning_gdf.columns:
+                    code_col = _candidate
+                    break
             if code_col is None:
                 for c in zoning_gdf.columns:
-                    if 'code' in c.lower() or 'cde' in c.lower():
+                    if c != 'geometry' and ('code' in c or 'cde' in c):
                         code_col = c
                         break
             if code_col is None:
                 st.error(f"⚠️ 용도지역 코드 컬럼을 찾을 수 없습니다. 컬럼: {list(zoning_gdf.columns)}")
-                code_col = zoning_gdf.columns[0]  # fallback
-            
-            unique_codes = zoning_gdf[code_col].unique()
-            st.caption(f"📋 [디버그] 코드컬럼={code_col}, 고유코드={list(unique_codes)[:15]}")
-            
+                code_col = [c for c in zoning_gdf.columns if c != 'geometry'][0]
+
+            unique_codes = zoning_gdf[code_col].astype(str).str.upper().unique()
+            st.caption(f"📋 [디버그] 코드컬럼={code_col}, 고유코드샘플={list(unique_codes)[:15]}")
+
+            # prefix 방식으로 target_zone 매핑
+            zoning_gdf['target_zone'] = zoning_gdf[code_col].apply(map_ucode_to_zone)
             before_filter = len(zoning_gdf)
-            zoning_gdf = zoning_gdf[zoning_gdf[code_col].isin(target_mapping.keys())]
-            st.caption(f"📋 [디버그] 필터 후: {before_filter} → {len(zoning_gdf)}개 (대상코드: {list(target_mapping.keys())})")
-            
+            zoning_gdf = zoning_gdf[zoning_gdf['target_zone'].notna()]
+            st.caption(f"📋 [디버그] prefix 필터 후: {before_filter} → {len(zoning_gdf)}개 (대상: 중심상업/일반상업/근린상업/준주거)")
+
             if not zoning_gdf.empty:
-                zoning_gdf['target_zone'] = zoning_gdf[code_col].map(target_mapping)
                 zoning_gdf['geom_wkt'] = zoning_gdf.geometry.to_wkt()
                 zoning_gdf = zoning_gdf.drop_duplicates(subset=['geom_wkt']).drop(columns=['geom_wkt'])
+
+        # target_mapping은 pivot용 zone 이름만 유지
+        target_mapping = {v: v for v in ZONE_NAMES}
 
         my_bar.progress(80, text="[3/4] 공간 연산 중...")
         if not zoning_gdf.empty:
