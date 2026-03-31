@@ -25,6 +25,42 @@ load_dotenv()
 
 st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_icon="🏙️", layout="wide")
 
+# ==========================================================
+# ★ DOHWA 테마 주입 (브랜드 컬러: Dark Teal #005B5B, Light Green #CDE89D)
+# ==========================================================
+st.markdown("""
+<style>
+    /* 헤더 및 섹션 제목 색상 변경 */
+    h1, h2, h3, h4, h5, h6 { color: #005B5B !important; }
+    
+    /* Primary 버튼(예: '분석 시작' 등) 색상 테마 적용 */
+    .stButton > button[kind="primary"] {
+        background-color: #005B5B !important;
+        color: white !important;
+        border: 1px solid #005B5B !important;
+        font-weight: bold;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background-color: #004040 !important;
+        border: 1px solid #004040 !important;
+        color: #CDE89D !important;
+    }
+    
+    /* Secondary 버튼 색상 테마 적용 */
+    .stButton > button {
+        border: 1px solid #005B5B !important;
+        color: #005B5B !important;
+    }
+    .stButton > button:hover {
+        background-color: #F2F7F7 !important;
+        border: 1px solid #005B5B !important;
+    }
+    
+    /* Info / Success 알림창 배경색 변경 */
+    div[data-testid="stChecklist"] { border-color: #005B5B !important; }
+</style>
+""", unsafe_allow_html=True)
+
 import urllib.request
 import urllib.error
 
@@ -382,7 +418,7 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
     payload = {"contents": contents}
     headers = {"Content-Type": "application/json"}
     
-    retries = 3
+    retries = 4 # API 서버 지연 고려하여 1회 증가
     for attempt in range(retries):
         try:
             res = requests.post(url, json=payload, headers=headers, timeout=300)
@@ -390,10 +426,16 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
                 return res.json()['candidates'][0]['content']['parts'][0]['text']
             elif res.status_code == 429: # Too Many Requests (Rate Limit)
                 if attempt < retries - 1:
-                    time.sleep(10 * (attempt + 1)) # API 할당량 초기화를 위해 10초, 20초 후 재시도
+                    time.sleep(10 * (attempt + 1)) # API 할당량 초기화를 위해 지연 대기
                     continue
                 else:
                     raise GeminiAPIError("Too Many Requests (Rate Limit - API 요청 속도 한도 초과)")
+            elif res.status_code == 503: # Service Unavailable (High Demand)
+                if attempt < retries - 1:
+                    time.sleep(15 * (attempt + 1)) # 과부하시 더 길게 대기(15s, 30s...)
+                    continue
+                else:
+                    raise GeminiAPIError("503 Service Unavailable (현재 AI 모델 사용량이 폭증하여 지연되고 있습니다. 잠시 후 1~2분 뒤 다시 시도해주세요.)")
             else:
                 if attempt < retries - 1:
                     time.sleep(5)
@@ -413,7 +455,7 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
                 continue
             raise GeminiAPIError(f"Connection Error: {str(e)}")
     
-    raise GeminiAPIError("통신 일시적 실패")
+    raise GeminiAPIError("통신 일시적 실패 (알 수 없는 오류)")
 
 
 
@@ -823,9 +865,9 @@ with chap1_tab:
 
 [상세 지시사항]
 1. 소제목은 반드시 '**번호. 소제목**' 형태(볼드+번호). 헤딩(###, ####) 절대 금지.
-2. 하위 세부 내용은 '-' 글머리 기호 3개씩 작성.
+2. 하위 세부 내용은 '-' 글머리 기호로 3개씩 작성.
 3. [분량] 각 세부 내용(꼭지)은 A4 2줄 이상(약 80~120자), 구체적 수치와 근거를 포함.
-4. [어투-핵심] 각 꼭지('-' 세부내용)는 반드시 하나의 문장으로만 구성. '~니다.', '~임.', '~함.' 등 중간 마침표로 문장을 끊지 말고, 한 문장이 끝까지 이어지도록 작성. 끝맺음은 '~확충', '~마련', '~필요', '~강화', '~도입' 등 핵심 명사 단어로 종결.
+4. [어투-핵심] 각 꼭지('-' 세부내용)는 반드시 하나의 연결된 문장으로만 구성. 절대로 '요약어: 설명' 형태(콜론으로 요약과 본문을 분리하는 구조)를 사용하지 말 것. 예컨대 '도시 확산: 2015년부터~'처럼 쓰지 말고, '2015년부터 도시가 확산되어~'처럼 하나의 자연스러운 문장으로 작성. 끝맺음은 '~확충', '~마련', '~필요', '~강화', '~도입' 등 핵심 명사 단어로 종결.
 5. 소제목과 첫 세부내용 사이 빈 줄 금지. 카테고리 간에만 빈 줄 1개.
 6. 인사말/맺음말/서두 일절 금지. 곧바로 ===SECTION_1=== 구분자부터 시작.
 7. [분석 중점] 중심지 구조의 공간적 분포 변화, 도시성장형태(확산형/정체형/축소형) 판단 근거, 인접 시·군과의 연담화 가능성 핵심 기술.
@@ -1207,7 +1249,7 @@ with chap1_tab:
 1. 전체를 3가지 주요 카테고리로 나누고, 소제목은 '**1. 소제목**' 형태(볼드체+번호)로 표시. 마크다운 헤딩(###, ####) 절대 금지.
 2. 하위 세부 내용은 '-' 글머리 기호로 3개씩 작성.
 3. [분량] 각 세부 내용은 A4 2줄 이상(약 80~120자), 구체적 행정동명과 수치를 적극 인용.
-4. [어투] '~확충', '~마련', '~필요', '~강화' 등 핵심 명사 단어로 종결.
+4. [어투-핵심] 각 꼭지('-' 세부내용)는 반드시 하나의 연결된 문장으로만 구성. 절대로 '요약어: 설명' 형태(콜론으로 요약과 본문을 분리하는 구조)를 사용하지 말 것. 예컨대 '인구 집중: 동구에~'처럼 쓰지 말고, '동구에 인구가 집중되어~'처럼 하나의 자연스러운 문장으로 작성. 끝맺음은 '~확충', '~마련', '~필요', '~강화' 등 핵심 명사 단어로 종결.
 5. 소제목과 첫 세부내용 사이 빈 줄 금지. 카테고리 간에만 빈 줄 1개.
 6. 인사말/맺음말/서두 문구 일절 금지. 곧바로 '**1. 소제목**'부터 시작.
 """
@@ -1313,7 +1355,7 @@ with chap1_tab:
 1. 전체를 3가지 주요 카테고리로 나누고, 소제목은 '**1. 소제목**' 형태(볼드체+번호)로 표시. 마크다운 헤딩(###, ####) 절대 금지.
 2. 하위 세부 내용은 '-' 글머리 기호로 3개씩 작성.
 3. [분량] 각 세부 내용은 A4 2줄 이상(약 80~120자), 구체적 행정동명과 수치를 적극 인용하여 길고 상세하게.
-4. [어투] '~확충', '~마련', '~필요', '~강화' 등 핵심 명사 단어로 종결.
+4. [어투-핵심] 각 꼭지('-' 세부내용)는 반드시 하나의 연결된 문장으로만 구성. 절대로 '요약어: 설명' 형태(콜론으로 요약과 본문을 분리하는 구조)를 사용하지 말 것. 예컨대 '중심지 쏠림: 북구와~'처럼 쓰지 말고, '북구와 광산구에 중심지 기능이 집중되어~'처럼 하나의 자연스러운 문장으로 작성. 끝맺음은 '~확충', '~마련', '~필요', '~강화' 등 핵심 명사 단어로 종결.
 5. 소제목과 첫 세부내용 사이 빈 줄 금지. 카테고리 간에만 빈 줄 1개.
 6. 인사말/맺음말/서두 문구 일절 금지. 곧바로 '**1. 소제목**'부터 시작.
 7. [분석 중점] 중심지 기능의 쏠림 현상, 신구 시가지 간 불균형, 취약 지역 발생, 교통축과 시가지 확산 간의 괴리 등 기존 공간구조가 가지는 구조적 문제점을 행정동명과 연계하여 서술.
