@@ -28,25 +28,17 @@ st.set_page_config(page_title="중심지 체계 현황 진단 시스템", page_i
 import urllib.request
 import urllib.error
 
-# ===== 폰트 로드 (로컬 TTF 파일 직접 지정 방식 - 플랫폼 무관) =====
+# ===== 폰트 로드 (로컬 TTF + 시스템 폰트 모두 탐색, Streamlit Cloud 대응) =====
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 1) 폰트 파일 경로 결정 (작업 디렉토리 → @@폰트 폴더)
-_local_font = os.path.join(_APP_DIR, 'NanumGothic.ttf')
-_source_font = os.path.join(_APP_DIR, '@@폰트', 'NanumGothic.ttf')
+# 1) 시스템 폰트 캐시 재구축 (Streamlit Cloud에서 packages.txt로 설치 후 필요)
+try:
+    import subprocess
+    subprocess.run(['fc-cache', '-fv'], capture_output=True, timeout=30)
+except Exception:
+    pass
 
-# @@폰트 폴더의 폰트를 작업 디렉토리로 복사
-if not os.path.exists(_local_font) and os.path.exists(_source_font):
-    import shutil
-    shutil.copy2(_source_font, _local_font)
-
-custom_font_path = None
-for _fp in [_local_font, _source_font, 'C:/Windows/Fonts/malgun.ttf', '/usr/share/fonts/truetype/nanum/NanumGothic.ttf']:
-    if os.path.exists(_fp):
-        custom_font_path = _fp
-        break
-
-# 2) matplotlib 폰트 캐시 삭제 후 재등록
+# 2) matplotlib 폰트 캐시 삭제
 try:
     import matplotlib as _mpl
     _cache_dir = _mpl.get_cachedir()
@@ -60,14 +52,35 @@ try:
 except Exception:
     pass
 
-# 3) 폰트 등록 및 FontProperties 생성 (rcParams 의존 최소화)
+# 3) 폰트 파일 경로 탐색 (시스템 설치 폰트 → 앱 디렉토리 → @@폰트 폴더 → Windows)
+_local_font = os.path.join(_APP_DIR, 'NanumGothic.ttf')
+_source_font = os.path.join(_APP_DIR, '@@폰트', 'NanumGothic.ttf')
+
+# @@폰트 폴더의 폰트를 작업 디렉토리로 복사
+if not os.path.exists(_local_font) and os.path.exists(_source_font):
+    import shutil
+    shutil.copy2(_source_font, _local_font)
+
+custom_font_path = None
+_font_search_paths = [
+    _local_font,
+    _source_font,
+    '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',      # packages.txt fonts-nanum
+    '/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf',
+    'C:/Windows/Fonts/malgun.ttf',
+]
+for _fp in _font_search_paths:
+    if os.path.exists(_fp):
+        custom_font_path = _fp
+        break
+
+# 4) 폰트 등록 및 FontProperties 생성
 if custom_font_path:
     try:
         fm.fontManager.addfont(custom_font_path)
     except Exception:
         pass
     custom_fontprops = fm.FontProperties(fname=custom_font_path)
-    # rcParams도 설정 (텍스트 위젯 등 fallback 용도)
     try:
         _family = custom_fontprops.get_name()
         if _family:
@@ -75,13 +88,23 @@ if custom_font_path:
     except Exception:
         plt.rcParams['font.family'] = 'NanumGothic'
 else:
-    if platform.system() == 'Windows':
-        plt.rcParams['font.family'] = 'Malgun Gothic'
-    elif platform.system() == 'Darwin':
-        plt.rcParams['font.family'] = 'AppleGothic'
-    else:
-        plt.rcParams['font.family'] = 'DejaVu Sans'
-    custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
+    # 시스템에 나눔고딕이 설치된 경우 (fontconfig 기반 탐색)
+    try:
+        _sys_font = fm.findfont(fm.FontProperties(family='NanumGothic'))
+        if _sys_font and 'NanumGothic' in _sys_font:
+            custom_font_path = _sys_font
+            custom_fontprops = fm.FontProperties(fname=_sys_font)
+            plt.rcParams['font.family'] = 'NanumGothic'
+        else:
+            raise FileNotFoundError
+    except Exception:
+        if platform.system() == 'Windows':
+            plt.rcParams['font.family'] = 'Malgun Gothic'
+        elif platform.system() == 'Darwin':
+            plt.rcParams['font.family'] = 'AppleGothic'
+        else:
+            plt.rcParams['font.family'] = 'DejaVu Sans'
+        custom_fontprops = fm.FontProperties(family=plt.rcParams['font.family'])
 
 plt.rcParams['axes.unicode_minus'] = False
 # ==========================================================
@@ -396,9 +419,10 @@ def get_gemini_response(prompt, history, api_key, model_override=None):
 # 1. API 요청 및 데이터 필터 함수 (기존과 동일)
 # ==========================================
 def safe_req(url, params=None, retries=3):
+    headers = {'Referer': 'http://localhost'}
     for attempt in range(retries):
         try:
-            res = requests.get(url, params=params, timeout=15)
+            res = requests.get(url, params=params, headers=headers, timeout=15)
             if res.status_code == 200:
                 return res.json()
             # 비200 응답 로깅 (API 키/도메인 문제 진단용)
